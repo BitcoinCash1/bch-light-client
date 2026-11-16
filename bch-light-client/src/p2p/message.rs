@@ -114,7 +114,10 @@ fn network_address(out: &mut Vec<u8>) {
 
 /// The version message of a light client: no services, no address.
 pub fn encode_version(user_agent: &str, relay: bool) -> Vec<u8> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let mut out = Vec::new();
     out.put_i32(PROTOCOL_VERSION);
     out.put_u64(0);
@@ -135,7 +138,11 @@ pub fn decode_version(payload: &[u8]) -> Result<VersionInfo, DecodeError> {
     r.bytes(8 + 26 + 26 + 8)?;
     let agent = r.var_bytes()?;
     let start_height = if r.remaining() >= 4 { r.i32()? } else { 0 };
-    let relay = if r.remaining() >= 1 { r.u8()? != 0 } else { true };
+    let relay = if r.remaining() >= 1 {
+        r.u8()? != 0
+    } else {
+        true
+    };
     Ok(VersionInfo {
         version,
         services,
@@ -207,7 +214,12 @@ pub fn decode_cfheaders(payload: &[u8]) -> Result<CfHeaders, DecodeError> {
     }
     let filter_hashes = (0..n).map(|_| r.array()).collect::<Result<_, _>>()?;
     r.finish()?;
-    Ok(CfHeaders { filter_type, stop, prev_header, filter_hashes })
+    Ok(CfHeaders {
+        filter_type,
+        stop,
+        prev_header,
+        filter_hashes,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -224,7 +236,11 @@ pub fn decode_cfcheckpt(payload: &[u8]) -> Result<CfCheckpt, DecodeError> {
     let n = r.count(32)?;
     let headers = (0..n).map(|_| r.array()).collect::<Result<_, _>>()?;
     r.finish()?;
-    Ok(CfCheckpt { filter_type, stop, headers })
+    Ok(CfCheckpt {
+        filter_type,
+        stop,
+        headers,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -240,7 +256,11 @@ pub fn decode_cfilter(payload: &[u8]) -> Result<CFilter, DecodeError> {
     let block = BlockHash(r.array()?);
     let filter = r.var_bytes()?.to_vec();
     r.finish()?;
-    Ok(CFilter { filter_type, block, filter })
+    Ok(CFilter {
+        filter_type,
+        block,
+        filter,
+    })
 }
 
 /// An inventory item: type and hash.
@@ -269,7 +289,10 @@ pub fn decode_inv(payload: &[u8]) -> Result<Vec<Inv>, DecodeError> {
     }
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        out.push(Inv { kind: r.u32()?, hash: r.array()? });
+        out.push(Inv {
+            kind: r.u32()?,
+            hash: r.array()?,
+        });
     }
     r.finish()?;
     Ok(out)
@@ -295,17 +318,32 @@ pub fn decode_reject(payload: &[u8]) -> Result<Reject, DecodeError> {
     let message = String::from_utf8_lossy(r.var_bytes()?).into_owned();
     let code = r.u8()?;
     let reason = String::from_utf8_lossy(r.var_bytes()?).into_owned();
-    let hash = if r.remaining() >= 32 { Some(r.array()?) } else { None };
-    Ok(Reject { message, code, reason, hash })
+    let hash = if r.remaining() >= 32 {
+        Some(r.array()?)
+    } else {
+        None
+    };
+    Ok(Reject {
+        message,
+        code,
+        reason,
+        hash,
+    })
 }
 
 impl Inv {
     pub fn block(hash: BlockHash) -> Self {
-        Self { kind: INV_BLOCK, hash: hash.0 }
+        Self {
+            kind: INV_BLOCK,
+            hash: hash.0,
+        }
     }
 
     pub fn tx(txid: Txid) -> Self {
-        Self { kind: INV_TX, hash: txid.0 }
+        Self {
+            kind: INV_TX,
+            hash: txid.0,
+        }
     }
 }
 
@@ -317,13 +355,21 @@ mod tests {
     async fn frames_round_trip_and_bad_checksums_fail() {
         let magic = [1, 2, 3, 4];
         let bytes = encode_message(magic, "ping", &[9u8; 8]);
-        let msg = read_message(&mut bytes.as_slice(), magic, || {}).await.unwrap();
+        let msg = read_message(&mut bytes.as_slice(), magic, || {})
+            .await
+            .unwrap();
         assert_eq!(msg.command, "ping");
         assert_eq!(msg.payload, vec![9u8; 8]);
         let mut bad = bytes.clone();
         *bad.last_mut().unwrap() ^= 1;
-        assert!(matches!(read_message(&mut bad.as_slice(), magic, || {}).await, Err(FrameError::Checksum)));
-        assert!(matches!(read_message(&mut bytes.as_slice(), [0; 4], || {}).await, Err(FrameError::Magic)));
+        assert!(matches!(
+            read_message(&mut bad.as_slice(), magic, || {}).await,
+            Err(FrameError::Checksum)
+        ));
+        assert!(matches!(
+            read_message(&mut bytes.as_slice(), [0; 4], || {}).await,
+            Err(FrameError::Magic)
+        ));
     }
 
     #[test]

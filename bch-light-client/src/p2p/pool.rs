@@ -25,7 +25,11 @@ pub struct Pool {
 }
 
 impl Pool {
-    pub fn new(addrs: Vec<PeerAddr>, options: PeerOptions, want: usize) -> (Arc<Pool>, mpsc::Receiver<PeerEvent>) {
+    pub fn new(
+        addrs: Vec<PeerAddr>,
+        options: PeerOptions,
+        want: usize,
+    ) -> (Arc<Pool>, mpsc::Receiver<PeerEvent>) {
         let (events, rx) = mpsc::channel(4096);
         let pool = Pool {
             addrs,
@@ -80,11 +84,13 @@ impl Pool {
             self.addrs
                 .iter()
                 .filter(|a| !connected.contains(a))
-                .filter(|a| retry.get(*a).map_or(true, |(at, _)| *at <= now))
+                .filter(|a| !matches!(retry.get(*a), Some((at, _)) if *at > now))
                 .cloned()
                 .collect()
         };
-        let Some(addr) = candidates.first().cloned() else { return };
+        let Some(addr) = candidates.first().cloned() else {
+            return;
+        };
         match Peer::connect(addr.clone(), &self.options, Some(self.events.clone())).await {
             Ok(peer) => {
                 info!(peer = %addr, agent = %peer.info.user_agent, height = peer.info.start_height, "connected");
@@ -96,13 +102,18 @@ impl Pool {
                     peer.send("mempool", Vec::new());
                 }
                 self.retry_at.lock().expect("retry lock").remove(&addr);
-                self.service.write().expect("pool lock").push(Arc::new(peer));
+                self.service
+                    .write()
+                    .expect("pool lock")
+                    .push(Arc::new(peer));
                 self.connected.notify_waiters();
             }
             Err(e) => {
                 debug!(peer = %addr, error = %e, "connect failed");
                 let mut retry = self.retry_at.lock().expect("retry lock");
-                let backoff = retry.get(&addr).map_or(Duration::from_secs(1), |(_, b)| (*b * 2).min(Duration::from_secs(60)));
+                let backoff = retry.get(&addr).map_or(Duration::from_secs(1), |(_, b)| {
+                    (*b * 2).min(Duration::from_secs(60))
+                });
                 retry.insert(addr, (Instant::now() + backoff, backoff));
             }
         }
@@ -110,7 +121,13 @@ impl Pool {
 
     /// The live service connections.
     pub fn peers(&self) -> Vec<Arc<Peer>> {
-        self.service.read().expect("pool lock").iter().filter(|p| p.is_alive()).cloned().collect()
+        self.service
+            .read()
+            .expect("pool lock")
+            .iter()
+            .filter(|p| p.is_alive())
+            .cloned()
+            .collect()
     }
 
     /// The next service connection, in turn.

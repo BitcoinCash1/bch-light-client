@@ -91,7 +91,10 @@ impl<'a> Gcs<'a> {
             return Err(DecodeError::Invalid("filter shorter than its item count"));
         }
         let pos = r.position();
-        Ok(Self { n, data: &bytes[pos..] })
+        Ok(Self {
+            n,
+            data: &bytes[pos..],
+        })
     }
 
     /// Every value, in order.
@@ -126,7 +129,11 @@ impl<'a> Gcs<'a> {
     /// Which of the sorted `targets` (values already mapped into this
     /// filter's range) the filter holds: one pass over the filter for any
     /// number of items. Calls `hit(i)` for each matching target index.
-    pub fn match_sorted(&self, targets: &[(u64, usize)], mut hit: impl FnMut(usize)) -> Result<(), DecodeError> {
+    pub fn match_sorted(
+        &self,
+        targets: &[(u64, usize)],
+        mut hit: impl FnMut(usize),
+    ) -> Result<(), DecodeError> {
         if self.n == 0 || targets.is_empty() {
             return Ok(());
         }
@@ -162,7 +169,12 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0, buf: 0, len: 0 }
+        Self {
+            data,
+            pos: 0,
+            buf: 0,
+            len: 0,
+        }
     }
 
     #[inline]
@@ -172,9 +184,17 @@ impl<'a> BitReader<'a> {
             return;
         }
         if self.pos + 8 <= self.data.len() {
-            let word = u64::from_be_bytes(self.data[self.pos..self.pos + 8].try_into().expect("8 bytes"));
+            let word = u64::from_be_bytes(
+                self.data[self.pos..self.pos + 8]
+                    .try_into()
+                    .expect("8 bytes"),
+            );
             // The first `take` bytes of the word, placed after the buffered bits.
-            let bytes = if take == 8 { word } else { (word >> (64 - take * 8)) << (64 - take * 8) };
+            let bytes = if take == 8 {
+                word
+            } else {
+                (word >> (64 - take * 8)) << (64 - take * 8)
+            };
             self.buf |= bytes >> self.len;
             self.pos += take as usize;
             self.len += take * 8;
@@ -274,8 +294,11 @@ mod tests {
     use serde_json::Value;
 
     fn vectors() -> Value {
-        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/script-filter-vectors.json"))
-            .expect("vectors");
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/script-filter-vectors.json"
+        ))
+        .expect("vectors");
         serde_json::from_str(&text).expect("json")
     }
 
@@ -299,10 +322,19 @@ mod tests {
         let mut block = [0u8; 32];
         hex::decode_to_slice(g["block"].as_str().unwrap(), &mut block).unwrap();
         let key = filter_key(&block);
-        let items: Vec<Vec<u8>> =
-            g["items"].as_array().unwrap().iter().map(|i| hex::decode(i.as_str().unwrap()).unwrap()).collect();
+        let items: Vec<Vec<u8>> = g["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| hex::decode(i.as_str().unwrap()).unwrap())
+            .collect();
         let filter = hex::decode(g["filter"].as_str().unwrap()).unwrap();
-        let expected: Vec<u64> = g["values"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+        let expected: Vec<u64> = g["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
         let gcs = Gcs::parse(&filter).unwrap();
         assert_eq!(gcs.values().unwrap(), expected);
         let refs: Vec<&[u8]> = items.iter().map(Vec::as_slice).collect();
@@ -312,8 +344,11 @@ mod tests {
         }
         assert!(!gcs.matches(key, &[0xffu8; 32]).unwrap());
         // One pass for many items finds every member and no stranger.
-        let mut targets: Vec<(u64, usize)> =
-            items.iter().enumerate().map(|(i, item)| (hash_to_range(key, gcs.n, item), i)).collect();
+        let mut targets: Vec<(u64, usize)> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| (hash_to_range(key, gcs.n, item), i))
+            .collect();
         targets.push((hash_to_range(key, gcs.n, &[0xffu8; 32]), items.len()));
         targets.sort_unstable();
         let mut hits = Vec::new();
@@ -330,7 +365,10 @@ mod tests {
         let script = hex::decode(g["script"].as_str().unwrap()).unwrap();
         let filter = hex::decode(g["filter"].as_str().unwrap()).unwrap();
         let gcs = Gcs::parse(&filter).unwrap();
-        assert_eq!(gcs.values().unwrap(), vec![g["values"][0].as_u64().unwrap()]);
+        assert_eq!(
+            gcs.values().unwrap(),
+            vec![g["values"][0].as_u64().unwrap()]
+        );
         assert!(gcs.matches(filter_key(&block.0), &script).unwrap());
     }
 }

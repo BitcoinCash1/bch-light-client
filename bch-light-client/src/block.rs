@@ -70,7 +70,11 @@ impl Block {
             txs.push(Transaction::read(&mut r)?);
         }
         r.finish()?;
-        Ok(Self { header, txs, size: bytes.len() })
+        Ok(Self {
+            header,
+            txs,
+            size: bytes.len(),
+        })
     }
 
     pub fn hash(&self) -> BlockHash {
@@ -113,7 +117,10 @@ pub fn merkle_branch(leaves: &[[u8; 32]], pos: usize) -> Vec<[u8; 32]> {
             level.push(*level.last().expect("non-empty level"));
         }
         branch.push(level[index ^ 1]);
-        level = level.chunks_exact(2).map(|p| sha256d_pair(&p[0], &p[1])).collect();
+        level = level
+            .chunks_exact(2)
+            .map(|p| sha256d_pair(&p[0], &p[1]))
+            .collect();
         index >>= 1;
     }
     branch
@@ -124,7 +131,11 @@ pub fn merkle_fold(leaf: [u8; 32], pos: usize, branch: &[[u8; 32]]) -> [u8; 32] 
     let mut node = leaf;
     let mut index = pos;
     for sibling in branch {
-        node = if index & 1 == 1 { sha256d_pair(sibling, &node) } else { sha256d_pair(&node, sibling) };
+        node = if index & 1 == 1 {
+            sha256d_pair(sibling, &node)
+        } else {
+            sha256d_pair(&node, sibling)
+        };
         index >>= 1;
     }
     node

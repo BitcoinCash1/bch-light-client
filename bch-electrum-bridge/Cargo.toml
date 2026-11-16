@@ -1,0 +1,19 @@
+[package]
+name = "bch-electrum-bridge"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Only for wallets that do not support the Bitcoin Cash P2P protocol: answers the Electrum protocol through the bch-light-client library. A wallet that supports P2P should be a light client itself, through the library, and talk to nodes directly."
+
+[dependencies]
+bch-light-client = { path = "../bch-light-client" }
+hex = "0.4"
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+k256 = { version = "0.13", features = ["ecdsa"] }
+ripemd = "0.1"

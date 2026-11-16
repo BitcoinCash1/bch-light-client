@@ -117,7 +117,7 @@ impl U256 {
         Self(out)
     }
 
-    pub fn shr(self, n: u32) -> Self {
+    fn shift_right(self, n: u32) -> Self {
         if n >= 256 {
             return Self::ZERO;
         }
@@ -143,7 +143,7 @@ impl U256 {
     }
 
     /// Integer division; panics on division by zero, a caller's bug.
-    pub fn div(self, divisor: Self) -> Self {
+    fn divide(self, divisor: Self) -> Self {
         assert!(!divisor.is_zero(), "U256 division by zero");
         if self < divisor {
             return Self::ZERO;
@@ -157,13 +157,27 @@ impl U256 {
                 rem = rem.wrapping_sub(d);
                 quotient.set_bit(i);
             }
-            d = d.shr(1);
+            d = d >> 1;
         }
         quotient
     }
 
     pub fn div_u64(self, divisor: u64) -> Self {
-        self.div(Self([divisor, 0, 0, 0]))
+        self / Self([divisor, 0, 0, 0])
+    }
+}
+
+impl std::ops::Div for U256 {
+    type Output = U256;
+    fn div(self, divisor: U256) -> U256 {
+        self.divide(divisor)
+    }
+}
+
+impl std::ops::Shr<u32> for U256 {
+    type Output = U256;
+    fn shr(self, n: u32) -> U256 {
+        self.shift_right(n)
     }
 }
 
@@ -197,7 +211,9 @@ pub fn compact_to_target(bits: u32) -> (U256, bool, bool) {
     };
     let negative = mantissa != 0 && bits & 0x0080_0000 != 0;
     let overflow = mantissa != 0
-        && (exponent > 34 || (mantissa > 0xff && exponent > 33) || (mantissa > 0xffff && exponent > 32));
+        && (exponent > 34
+            || (mantissa > 0xff && exponent > 33)
+            || (mantissa > 0xffff && exponent > 32));
     (value, negative, overflow)
 }
 
@@ -207,7 +223,7 @@ pub fn target_to_compact(target: U256) -> u32 {
     let mut compact = if size <= 3 {
         (target.low_u64() << (8 * (3 - size))) as u32
     } else {
-        target.shr(8 * (size - 3)).low_u64() as u32
+        target.shift_right(8 * (size - 3)).low_u64() as u32
     };
     if compact & 0x0080_0000 != 0 {
         compact >>= 8;
@@ -219,7 +235,11 @@ pub fn target_to_compact(target: U256) -> u32 {
 /// Whether a block hash meets the target its bits encode.
 pub fn meets_target(hash: &[u8; 32], bits: u32, pow_limit: U256) -> bool {
     let (target, negative, overflow) = compact_to_target(bits);
-    !negative && !overflow && !target.is_zero() && target <= pow_limit && U256::from_le_bytes(hash) <= target
+    !negative
+        && !overflow
+        && !target.is_zero()
+        && target <= pow_limit
+        && U256::from_le_bytes(hash) <= target
 }
 
 /// The expected number of hashes for a block of these bits: 2^256 / (target + 1).
@@ -233,7 +253,9 @@ pub fn work(bits: u32) -> u128 {
     if carry {
         return 1;
     }
-    target.not().div(plus_one).saturating_u128().saturating_add(1)
+    (target.not() / plus_one)
+        .saturating_u128()
+        .saturating_add(1)
 }
 
 /// What the difficulty rules need from the chain a new header extends.
@@ -285,8 +307,14 @@ pub fn required_bits(params: &Params, chain: &impl ChainView, prev: u32, new_tim
     }
 }
 
-fn min_difficulty_applies(params: &Params, chain: &impl ChainView, prev: u32, new_time: u32) -> bool {
-    params.reduce_min_difficulty && i64::from(new_time) > i64::from(chain.time_at(prev)) + 2 * TARGET_SPACING
+fn min_difficulty_applies(
+    params: &Params,
+    chain: &impl ChainView,
+    prev: u32,
+    new_time: u32,
+) -> bool {
+    params.reduce_min_difficulty
+        && i64::from(new_time) > i64::from(chain.time_at(prev)) + 2 * TARGET_SPACING
 }
 
 /// aserti3-2d: the target follows the anchor block's exponentially, by how far
@@ -314,12 +342,12 @@ pub fn asert_target(
     let scaled = anchor.checked_mul_u64(RADIX as u64 + factor as u64);
     let shifted = scaled.and_then(|t| {
         if shifts < 0 {
-            Some(t.shr(u32::try_from(-shifts).unwrap_or(u32::MAX)))
+            Some(t >> u32::try_from(-shifts).unwrap_or(u32::MAX))
         } else {
             t.checked_shl(u32::try_from(shifts).unwrap_or(u32::MAX))
         }
     });
-    match shifted.map(|t| t.shr(RBITS)) {
+    match shifted.map(|t| t.shift_right(RBITS)) {
         Some(t) if t.is_zero() => U256::ONE,
         Some(t) if t <= pow_limit => t,
         _ => pow_limit,
@@ -364,11 +392,17 @@ fn daa_bits(params: &Params, chain: &impl ChainView, prev: u32, new_time: u32) -
     }
     let pw = U256::from_u128(projected);
     // (2^256 - pw) / pw
-    let target = U256::ZERO.wrapping_sub(pw).div(pw);
+    let target = U256::ZERO.wrapping_sub(pw) / pw;
     target_to_compact(target.min(params.pow_limit()))
 }
 
-fn legacy_bits(params: &Params, chain: &impl ChainView, prev: u32, new_time: u32, eda: bool) -> u32 {
+fn legacy_bits(
+    params: &Params,
+    chain: &impl ChainView,
+    prev: u32,
+    new_time: u32,
+    eda: bool,
+) -> u32 {
     let height = prev + 1;
     if height % RETARGET_INTERVAL != 0 {
         if params.reduce_min_difficulty {
@@ -390,9 +424,13 @@ fn legacy_bits(params: &Params, chain: &impl ChainView, prev: u32, new_time: u32
             let mtp_span = i64::from(chain.median_time_past(prev))
                 - i64::from(chain.median_time_past(prev.saturating_sub(6)));
             if mtp_span >= 12 * 3600 {
-                let (raised, carry) = old.overflowing_add(old.shr(2));
+                let (raised, carry) = old.overflowing_add(old.shift_right(2));
                 let limit = params.pow_limit();
-                return if carry || raised > limit { params.pow_limit_bits } else { target_to_compact(raised) };
+                return if carry || raised > limit {
+                    params.pow_limit_bits
+                } else {
+                    target_to_compact(raised)
+                };
             }
         }
         return chain.bits_at(prev);
@@ -414,7 +452,14 @@ mod tests {
 
     #[test]
     fn compact_round_trips() {
-        for bits in [0x1d00ffffu32, 0x1804dafe, 0x207fffff, 0x1a2b3c4d, 0x01010000, 0x13647d71] {
+        for bits in [
+            0x1d00ffffu32,
+            0x1804dafe,
+            0x207fffff,
+            0x1a2b3c4d,
+            0x01010000,
+            0x13647d71,
+        ] {
             let (t, neg, ovf) = compact_to_target(bits);
             assert!(!neg && !ovf);
             assert_eq!(target_to_compact(t), bits, "{bits:08x}");
@@ -434,16 +479,27 @@ mod tests {
 
     #[test]
     fn division_matches_u128() {
-        let cases = [(u128::MAX, 3u128), (12345678901234567890123456789, 987654321), (5, 7), (1 << 100, 1 << 37)];
+        let cases = [
+            (u128::MAX, 3u128),
+            (12345678901234567890123456789, 987654321),
+            (5, 7),
+            (1 << 100, 1 << 37),
+        ];
         for (a, b) in cases {
-            assert_eq!(U256::from_u128(a).div(U256::from_u128(b)).saturating_u128(), a / b);
+            assert_eq!(
+                (U256::from_u128(a) / U256::from_u128(b)).saturating_u128(),
+                a / b
+            );
         }
     }
 
     #[test]
     fn asert_matches_the_reference_vectors() {
-        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/asert-vectors.txt"))
-            .expect("asert vectors");
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/asert-vectors.txt"
+        ))
+        .expect("asert vectors");
         let pow_limit = compact_to_target(0x1d00ffff).0;
         let mut anchor = (0i32, 0i64, 0u32);
         let mut checked = 0;
@@ -454,7 +510,11 @@ mod tests {
             // the height difference matters, so it is taken the same way.
             let as_i32 = |s: &str| s.parse::<u64>().unwrap() as i32;
             if parts[0] == "run" {
-                anchor = (as_i32(parts[2]), parts[3].parse().unwrap(), hex_bits(parts[4]));
+                anchor = (
+                    as_i32(parts[2]),
+                    parts[3].parse().unwrap(),
+                    hex_bits(parts[4]),
+                );
                 continue;
             }
             let height = as_i32(parts[0]);
@@ -462,7 +522,11 @@ mod tests {
             let expected = hex_bits(parts[2]);
             let delta = i64::from(height.wrapping_sub(anchor.0));
             let target = asert_target(pow_limit, anchor.2, 0, anchor.1, 2 * 24 * 3600, delta, time);
-            assert_eq!(target_to_compact(target), expected, "height {height} time {time}");
+            assert_eq!(
+                target_to_compact(target),
+                expected,
+                "height {height} time {time}"
+            );
             checked += 1;
         }
         assert!(checked > 10_000);

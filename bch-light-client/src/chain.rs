@@ -103,7 +103,12 @@ impl HeaderChain {
     /// Opens the header file, keeping the longest prefix that chains from
     /// genesis and meets its targets.
     pub fn open(path: &Path, params: &'static Params) -> std::io::Result<Self> {
-        let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
         let mut raw = Vec::new();
         file.read_to_end(&mut raw)?;
         let genesis = params.genesis();
@@ -127,7 +132,9 @@ impl HeaderChain {
                 continue;
             }
             let hash = header.hash();
-            if header.prev_hash != chain.hashes[i - 1] || !meets_target(&hash.0, header.bits, pow_limit) {
+            if header.prev_hash != chain.hashes[i - 1]
+                || !meets_target(&hash.0, header.bits, pow_limit)
+            {
                 break;
             }
             let total = chain.work[i - 1].saturating_add(work(header.bits));
@@ -172,7 +179,10 @@ impl HeaderChain {
 
     /// The height of a block of the chain, searched from the tip down.
     pub fn height_of(&self, hash: &BlockHash) -> Option<u32> {
-        self.hashes.iter().rposition(|h| h == hash).map(|i| i as u32)
+        self.hashes
+            .iter()
+            .rposition(|h| h == hash)
+            .map(|i| i as u32)
     }
 
     /// Ten newest hashes, then exponentially sparser ones, then genesis.
@@ -194,8 +204,12 @@ impl HeaderChain {
     /// Checks headers that follow a known block and takes them when they
     /// extend the chain or make a branch with more work.
     pub fn accept(&mut self, headers: &[BlockHeader]) -> Result<Accepted, HeaderError> {
-        let Some(first) = headers.first() else { return Ok(Accepted::Known) };
-        let parent = self.height_of(&first.prev_hash).ok_or(HeaderError::Unconnected)?;
+        let Some(first) = headers.first() else {
+            return Ok(Accepted::Known);
+        };
+        let parent = self
+            .height_of(&first.prev_hash)
+            .ok_or(HeaderError::Unconnected)?;
         // Skip what the chain has already.
         let known = headers
             .iter()
@@ -207,18 +221,33 @@ impl HeaderChain {
         if branch.is_empty() {
             return Ok(Accepted::Known);
         }
-        if let Some(cp) = self.params.checkpoints.iter().map(|(h, _)| *h).filter(|h| *h <= self.tip_height()).max() {
+        if let Some(cp) = self
+            .params
+            .checkpoints
+            .iter()
+            .map(|(h, _)| *h)
+            .filter(|h| *h <= self.tip_height())
+            .max()
+        {
             if fork < cp {
                 return Err(HeaderError::ForkBelowCheckpoint(cp));
             }
         }
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let pow_limit = self.params.pow_limit();
         let mut branch_work: Vec<u128> = Vec::with_capacity(branch.len());
         let mut prev_hash = self.hashes[fork as usize];
         for (i, header) in branch.iter().enumerate() {
             let height = fork + 1 + i as u32;
-            let view = BranchView { chain: self, fork, branch: &branch[..i], work: &branch_work };
+            let view = BranchView {
+                chain: self,
+                fork,
+                branch: &branch[..i],
+                work: &branch_work,
+            };
             let hash = header.hash();
             if header.prev_hash != prev_hash {
                 return Err(HeaderError::NotAChain(height));
@@ -228,7 +257,12 @@ impl HeaderChain {
             }
             let expected = required_bits(self.params, &view, height - 1, header.time);
             if header.bits != expected {
-                return Err(crate::pow::BadBits { height, got: header.bits, expected }.into());
+                return Err(crate::pow::BadBits {
+                    height,
+                    got: header.bits,
+                    expected,
+                }
+                .into());
             }
             if header.time <= view.median_time_past(height - 1) {
                 return Err(HeaderError::TooOld(height));
@@ -239,7 +273,10 @@ impl HeaderChain {
             if self.params.checkpoint(height).is_some_and(|cp| cp != hash) {
                 return Err(HeaderError::Checkpoint(height));
             }
-            branch_work.push(view.chainwork_at(height - 1).saturating_add(work(header.bits)));
+            branch_work.push(
+                view.chainwork_at(height - 1)
+                    .saturating_add(work(header.bits)),
+            );
             prev_hash = hash;
         }
         let branch_tip = fork + branch.len() as u32;
@@ -248,14 +285,19 @@ impl HeaderChain {
             return Ok(Accepted::LessWork { fork, branch_tip });
         }
         let replaced = fork < self.tip_height();
-        self.truncate_to(fork).map_err(|_| HeaderError::Unconnected)?;
+        self.truncate_to(fork)
+            .map_err(|_| HeaderError::Unconnected)?;
         for (header, total) in branch.iter().zip(branch_work) {
             self.hashes.push(header.hash());
             self.headers.push(*header);
             self.work.push(total);
         }
-        self.persist_from(fork + 1).map_err(|_| HeaderError::Unconnected)?;
-        Ok(Accepted::Extended { fork: replaced.then_some(fork), tip: self.tip_height() })
+        self.persist_from(fork + 1)
+            .map_err(|_| HeaderError::Unconnected)?;
+        Ok(Accepted::Extended {
+            fork: replaced.then_some(fork),
+            tip: self.tip_height(),
+        })
     }
 
     fn truncate_to(&mut self, height: u32) -> std::io::Result<()> {
@@ -268,7 +310,10 @@ impl HeaderChain {
 
     fn persist_from(&mut self, height: u32) -> std::io::Result<()> {
         let start = height as usize;
-        let bytes: Vec<u8> = self.headers[start..].iter().flat_map(|h| h.to_bytes()).collect();
+        let bytes: Vec<u8> = self.headers[start..]
+            .iter()
+            .flat_map(|h| h.to_bytes())
+            .collect();
         self.file.seek(SeekFrom::Start((start * 80) as u64))?;
         self.file.write_all(&bytes)?;
         self.file.flush()
@@ -298,7 +343,10 @@ mod tests {
     }
 
     fn temp_file(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("bch-light-client-test-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "bch-light-client-test-{}-{name}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("headers.dat");
         let _ = std::fs::remove_file(&path);
@@ -316,16 +364,31 @@ mod tests {
             let next = mine(main.last().unwrap(), genesis.time + 600 * (i + 1), i);
             main.push(next);
         }
-        assert_eq!(chain.accept(&main[1..]).unwrap(), Accepted::Extended { fork: None, tip: 5 });
+        assert_eq!(
+            chain.accept(&main[1..]).unwrap(),
+            Accepted::Extended { fork: None, tip: 5 }
+        );
         assert_eq!(chain.accept(&main[3..]).unwrap(), Accepted::Known);
         // A branch from height 3 of the same length has no more work.
         let mut side = vec![main[3]];
         for i in 0..2 {
             side.push(mine(side.last().unwrap(), genesis.time + 2000 + i, 100 + i));
         }
-        assert_eq!(chain.accept(&side[1..]).unwrap(), Accepted::LessWork { fork: 3, branch_tip: 5 });
+        assert_eq!(
+            chain.accept(&side[1..]).unwrap(),
+            Accepted::LessWork {
+                fork: 3,
+                branch_tip: 5
+            }
+        );
         side.push(mine(side.last().unwrap(), genesis.time + 3000, 200));
-        assert_eq!(chain.accept(&side[1..]).unwrap(), Accepted::Extended { fork: Some(3), tip: 6 });
+        assert_eq!(
+            chain.accept(&side[1..]).unwrap(),
+            Accepted::Extended {
+                fork: Some(3),
+                tip: 6
+            }
+        );
         assert_eq!(chain.hash_at(6), Some(side[3].hash()));
         drop(chain);
         let reopened = HeaderChain::open(&path, params).unwrap();

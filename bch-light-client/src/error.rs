@@ -36,7 +36,11 @@ pub struct Error {
 
 impl Error {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into(), source: None }
+        Self {
+            kind,
+            message: message.into(),
+            source: None,
+        }
     }
 
     pub(crate) fn with_source(
@@ -44,7 +48,11 @@ impl Error {
         message: impl Into<String>,
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
-        Self { kind, message: message.into(), source: Some(Box::new(source)) }
+        Self {
+            kind,
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
     }
 
     pub fn kind(&self) -> ErrorKind {
@@ -72,7 +80,9 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
+        self.source
+            .as_ref()
+            .map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
     }
 }
 

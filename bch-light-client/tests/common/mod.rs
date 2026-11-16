@@ -22,13 +22,38 @@ pub fn bchd_binary() -> Option<PathBuf> {
         return Some(PathBuf::from(path));
     }
     let exe = if cfg!(windows) { "bchd.exe" } else { "bchd" };
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(".tools").join(exe);
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(".tools")
+        .join(exe);
+    path.exists().then_some(path)
+}
+
+/// A bchd whose script filters hold transaction keys (kind 4):
+/// $BCHD_TXID_BIN, or .tools/bchd-txid(.exe).
+pub fn bchd_txid_binary() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("BCHD_TXID_BIN") {
+        return Some(PathBuf::from(path));
+    }
+    let exe = if cfg!(windows) {
+        "bchd-txid.exe"
+    } else {
+        "bchd-txid"
+    };
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(".tools")
+        .join(exe);
     path.exists().then_some(path)
 }
 
 /// A port the OS gives out now; bchd binds it right after.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 pub fn sha256(b: &[u8]) -> [u8; 32] {
@@ -95,8 +120,13 @@ impl Drop for Bchd {
 impl Bchd {
     /// Starts bchd on regtest with OS-assigned ports and waits until its RPC answers.
     pub async fn start(name: &str) -> Bchd {
-        let bin = bchd_binary().expect("bchd binary");
-        let dir = std::env::temp_dir().join(format!("bch-light-client-it-{}-{name}", std::process::id()));
+        Self::start_with(&bchd_binary().expect("bchd binary"), name).await
+    }
+
+    /// Starts the given bchd binary.
+    pub async fn start_with(bin: &Path, name: &str) -> Bchd {
+        let dir =
+            std::env::temp_dir().join(format!("bch-light-client-it-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p2p_port = free_port();
@@ -112,18 +142,30 @@ impl Bchd {
             .arg("--rpcpass=p")
             .arg("--notls")
             .arg(format!("--miningaddr={MINING_ADDRESS}"))
-            .arg("--debuglevel=info")
+            .arg(format!(
+                "--debuglevel={}",
+                std::env::var("BCHD_DEBUGLEVEL").unwrap_or_else(|_| "info".into())
+            ))
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()
             .expect("start bchd");
-        let node = Bchd { child, p2p_port, rpc_port, dir };
+        let node = Bchd {
+            child,
+            p2p_port,
+            rpc_port,
+            dir,
+        };
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if node.rpc_raw("getblockcount", json!([])).await.is_ok() {
                 break;
             }
-            assert!(Instant::now() < deadline, "bchd did not start; see {}", node.dir.display());
+            assert!(
+                Instant::now() < deadline,
+                "bchd did not start; see {}",
+                node.dir.display()
+            );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         node
@@ -134,19 +176,29 @@ impl Bchd {
     }
 
     async fn rpc_raw(&self, method: &str, params: Value) -> Result<Value, String> {
-        let body = json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params}).to_string();
-        let mut stream = TcpStream::connect(("127.0.0.1", self.rpc_port)).await.map_err(|e| e.to_string())?;
+        let body =
+            json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params}).to_string();
+        let mut stream = TcpStream::connect(("127.0.0.1", self.rpc_port))
+            .await
+            .map_err(|e| e.to_string())?;
         let request = format!(
             "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic dTpw\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
-        stream.write_all(request.as_bytes()).await.map_err(|e| e.to_string())?;
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).await.map_err(|e| e.to_string())?;
+        stream
+            .read_to_end(&mut response)
+            .await
+            .map_err(|e| e.to_string())?;
         let text = String::from_utf8_lossy(&response);
         let json_start = text.find("\r\n\r\n").ok_or("no body")? + 4;
-        let value: Value = serde_json::from_str(&text[json_start..]).map_err(|e| format!("{e}: {text}"))?;
+        let value: Value =
+            serde_json::from_str(&text[json_start..]).map_err(|e| format!("{e}: {text}"))?;
         if !value["error"].is_null() {
             return Err(value["error"].to_string());
         }
@@ -174,7 +226,10 @@ impl Bchd {
         loop {
             let result = self.rpc("generate", json!([n])).await;
             if let Some(hashes) = result.as_array() {
-                return hashes.iter().map(|v| v.as_str().unwrap().to_string()).collect();
+                return hashes
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect();
             }
             assert!(Instant::now() < deadline, "generate answered {result}");
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -189,19 +244,29 @@ impl Bchd {
         if block["rawtx"].is_array() {
             block["tx"] = block["rawtx"].take();
         }
-        assert!(block["tx"][0]["txid"].is_string(), "getblock verbosity 2 gave {block}");
+        assert!(
+            block["tx"][0]["txid"].is_string(),
+            "getblock verbosity 2 gave {block}"
+        );
         block
     }
 
     pub async fn send(&self, raw: &[u8]) -> String {
-        self.rpc("sendrawtransaction", json!([hex::encode(raw)])).await.as_str().unwrap().to_string()
+        self.rpc("sendrawtransaction", json!([hex::encode(raw)]))
+            .await
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     /// The coinbase output of the block at `height`: outpoint and value.
     pub async fn coinbase(&self, height: u32) -> (OutPoint, u64) {
         let block = self.block(height).await;
         let tx = &block["tx"][0];
-        (OutPoint::new(Txid::from_hex(tx["txid"].as_str().unwrap()).unwrap(), 0), sats(&tx["vout"][0]["value"]))
+        (
+            OutPoint::new(Txid::from_hex(tx["txid"].as_str().unwrap()).unwrap(), 0),
+            sats(&tx["vout"][0]["value"]),
+        )
     }
 }
 
@@ -218,7 +283,11 @@ pub struct Key {
 impl Key {
     pub fn new(seed: u8) -> Self {
         let sk = SigningKey::from_bytes(&[seed; 32].into()).unwrap();
-        let pubkey = sk.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+        let pubkey = sk
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
         Self { sk, pubkey }
     }
 
@@ -332,13 +401,26 @@ pub fn nft_prefix(category: &Category, commitment: &[u8]) -> Vec<u8> {
 /// hex), amount, and NFT capability and commitment.
 pub type Token = Option<(String, u64, Option<(String, String)>)>;
 
+/// Outputs a transaction gives a target: (vout, value, token).
+pub type ReceivedRows = Vec<(u32, u64, Token)>;
+/// Inputs that spend a target's outputs: (vin, prevout, value).
+pub type SpentRows = Vec<(u32, String, u64)>;
+
 pub fn token_from_json(v: &Value) -> Token {
     if v.is_null() {
         return None;
     }
-    let nft = (!v["nft"].is_null())
-        .then(|| (v["nft"]["capability"].as_str().unwrap().to_string(), v["nft"]["commitment"].as_str().unwrap().to_string()));
-    Some((v["category"].as_str().unwrap().to_string(), v["amount"].as_str().unwrap().parse().unwrap(), nft))
+    let nft = (!v["nft"].is_null()).then(|| {
+        (
+            v["nft"]["capability"].as_str().unwrap().to_string(),
+            v["nft"]["commitment"].as_str().unwrap().to_string(),
+        )
+    });
+    Some((
+        v["category"].as_str().unwrap().to_string(),
+        v["amount"].as_str().unwrap().parse().unwrap(),
+        nft,
+    ))
 }
 
 pub fn token_from_lib(t: &Option<bch_light_client::TokenData>) -> Token {
@@ -346,7 +428,12 @@ pub fn token_from_lib(t: &Option<bch_light_client::TokenData>) -> Token {
         (
             t.category.to_hex(),
             t.amount,
-            t.nft.as_ref().map(|n| (n.capability.as_str().to_string(), hex::encode(&n.commitment))),
+            t.nft.as_ref().map(|n| {
+                (
+                    n.capability.as_str().to_string(),
+                    hex::encode(&n.commitment),
+                )
+            }),
         )
     })
 }
@@ -357,7 +444,7 @@ pub struct Truth {
     /// (txid, height, position) in chain order.
     pub confirmed: Vec<(String, u32, u32)>,
     /// Per txid: received (vout, value, token) and spent (vin, prevout, value).
-    pub detail: BTreeMap<String, (Vec<(u32, u64, Token)>, Vec<(u32, String, u64)>)>,
+    pub detail: BTreeMap<String, (ReceivedRows, SpentRows)>,
     /// Unconfirmed txids.
     pub mempool: Vec<String>,
     /// Confirmed unspent: outpoint "txid:vout", value, token, height.
@@ -371,13 +458,19 @@ pub struct Truth {
 #[derive(Clone)]
 pub enum Watch {
     Script(Vec<u8>),
+    ScriptHash([u8; 32]),
     Category(String),
 }
 
 impl Watch {
     fn owns(&self, vout: &Value) -> bool {
         match self {
-            Watch::Script(script) => vout["scriptPubKey"]["hex"].as_str() == Some(&hex::encode(script)),
+            Watch::Script(script) => {
+                vout["scriptPubKey"]["hex"].as_str() == Some(&hex::encode(script))
+            }
+            Watch::ScriptHash(hash) => vout["scriptPubKey"]["hex"]
+                .as_str()
+                .is_some_and(|h| sha256(&hex::decode(h).unwrap()) == *hash),
             Watch::Category(cat) => vout["tokenData"]["category"].as_str() == Some(cat.as_str()),
         }
     }
@@ -391,25 +484,40 @@ pub async fn truth(node: &Bchd, blocks: &[Value], watch: &Watch) -> Truth {
     for (height, block) in blocks.iter().enumerate() {
         let txs = block["tx"].as_array().unwrap();
         // Outputs of the whole block first, then inputs.
-        let mut per_tx: BTreeMap<u32, (String, Vec<(u32, u64, Token)>, Vec<(u32, String, u64)>)> = BTreeMap::new();
+        let mut per_tx: BTreeMap<u32, (String, ReceivedRows, SpentRows)> = BTreeMap::new();
         for (pos, tx) in txs.iter().enumerate() {
             let txid = tx["txid"].as_str().unwrap().to_string();
             for vout in tx["vout"].as_array().unwrap() {
                 if watch.owns(vout) {
                     let n = vout["n"].as_u64().unwrap() as u32;
                     let token = token_from_json(&vout["tokenData"]);
-                    coins.insert(format!("{txid}:{n}"), (sats(&vout["value"]), token.clone(), height as u32));
-                    per_tx.entry(pos as u32).or_insert_with(|| (txid.clone(), vec![], vec![])).1.push((n, sats(&vout["value"]), token));
+                    coins.insert(
+                        format!("{txid}:{n}"),
+                        (sats(&vout["value"]), token.clone(), height as u32),
+                    );
+                    per_tx
+                        .entry(pos as u32)
+                        .or_insert_with(|| (txid.clone(), vec![], vec![]))
+                        .1
+                        .push((n, sats(&vout["value"]), token));
                 }
             }
         }
         for (pos, tx) in txs.iter().enumerate().skip(1) {
             let txid = tx["txid"].as_str().unwrap().to_string();
             for (vin, input) in tx["vin"].as_array().unwrap().iter().enumerate() {
-                let prev = format!("{}:{}", input["txid"].as_str().unwrap(), input["vout"].as_u64().unwrap());
+                let prev = format!(
+                    "{}:{}",
+                    input["txid"].as_str().unwrap(),
+                    input["vout"].as_u64().unwrap()
+                );
                 if let Some((value, _, _)) = coins.get(&prev) {
                     spent.insert(prev.clone(), ());
-                    per_tx.entry(pos as u32).or_insert_with(|| (txid.clone(), vec![], vec![])).2.push((vin as u32, prev, *value));
+                    per_tx
+                        .entry(pos as u32)
+                        .or_insert_with(|| (txid.clone(), vec![], vec![]))
+                        .2
+                        .push((vin as u32, prev, *value));
                 }
             }
         }
@@ -432,7 +540,10 @@ pub async fn truth(node: &Bchd, blocks: &[Value], watch: &Watch) -> Truth {
         for vout in tx["vout"].as_array().unwrap() {
             if watch.owns(vout) {
                 let n = vout["n"].as_u64().unwrap();
-                mempool_coins.insert(format!("{txid}:{n}"), (sats(&vout["value"]), token_from_json(&vout["tokenData"])));
+                mempool_coins.insert(
+                    format!("{txid}:{n}"),
+                    (sats(&vout["value"]), token_from_json(&vout["tokenData"])),
+                );
                 touched.insert(txid.clone(), ());
                 t.balance_unconfirmed += sats(&vout["value"]) as i64;
             }
@@ -441,9 +552,16 @@ pub async fn truth(node: &Bchd, blocks: &[Value], watch: &Watch) -> Truth {
     for tx in &pool_txs {
         let txid = tx["txid"].as_str().unwrap().to_string();
         for input in tx["vin"].as_array().unwrap() {
-            let prev = format!("{}:{}", input["txid"].as_str().unwrap(), input["vout"].as_u64().unwrap());
+            let prev = format!(
+                "{}:{}",
+                input["txid"].as_str().unwrap(),
+                input["vout"].as_u64().unwrap()
+            );
             mempool_spent.insert(prev.clone(), ());
-            let value = coins.get(&prev).map(|c| c.0).or_else(|| mempool_coins.get(&prev).map(|c| c.0));
+            let value = coins
+                .get(&prev)
+                .map(|c| c.0)
+                .or_else(|| mempool_coins.get(&prev).map(|c| c.0));
             if let Some(value) = value {
                 touched.insert(txid.clone(), ());
                 t.balance_unconfirmed -= value as i64;

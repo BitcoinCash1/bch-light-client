@@ -3,7 +3,8 @@
 //! other message passed on as an event.
 
 use super::message::{
-    decode_version, encode_message, encode_version, read_message, FrameError, RawMessage, VersionInfo,
+    decode_version, encode_message, encode_version, read_message, FrameError, RawMessage,
+    VersionInfo,
 };
 use super::socks::{connect, ConnectError, PeerAddr, Transport};
 use std::collections::VecDeque;
@@ -95,10 +96,22 @@ impl Peer {
         options: &PeerOptions,
         events: Option<mpsc::Sender<PeerEvent>>,
     ) -> Result<Peer, PeerError> {
-        let stream = connect(&addr, &options.transport, options.isolate, options.connect_timeout).await?;
+        let stream = connect(
+            &addr,
+            &options.transport,
+            options.isolate,
+            options.connect_timeout,
+        )
+        .await?;
         let (mut read, mut write) = stream.into_split();
         let magic = options.magic;
-        write.write_all(&encode_message(magic, "version", &encode_version(&options.user_agent, options.relay))).await
+        write
+            .write_all(&encode_message(
+                magic,
+                "version",
+                &encode_version(&options.user_agent, options.relay),
+            ))
+            .await
             .map_err(FrameError::from)?;
         let handshake = async {
             let mut info = None;
@@ -107,13 +120,20 @@ impl Peer {
                 let msg = read_message(&mut read, magic, || {}).await?;
                 match msg.command.as_str() {
                     "version" => {
-                        let v = decode_version(&msg.payload).map_err(|e| PeerError::Handshake(e.to_string()))?;
-                        write.write_all(&encode_message(magic, "verack", &[])).await.map_err(FrameError::from)?;
+                        let v = decode_version(&msg.payload)
+                            .map_err(|e| PeerError::Handshake(e.to_string()))?;
+                        write
+                            .write_all(&encode_message(magic, "verack", &[]))
+                            .await
+                            .map_err(FrameError::from)?;
                         info = Some(v);
                     }
                     "verack" => verack = true,
                     "ping" => {
-                        write.write_all(&encode_message(magic, "pong", &msg.payload)).await.map_err(FrameError::from)?;
+                        write
+                            .write_all(&encode_message(magic, "pong", &msg.payload))
+                            .await
+                            .map_err(FrameError::from)?;
                     }
                     _ => {}
                 }
@@ -161,7 +181,13 @@ impl Peer {
             actor_alive.store(false, Ordering::Relaxed);
             reader.abort();
         });
-        let peer = Peer { id, addr, info, commands, alive };
+        let peer = Peer {
+            id,
+            addr,
+            info,
+            commands,
+            alive,
+        };
         peer.send("sendheaders", Vec::new());
         Ok(peer)
     }
@@ -187,7 +213,13 @@ impl Peer {
     ) -> Result<Vec<RawMessage>, PeerError> {
         let (reply, answer) = oneshot::channel();
         self.commands
-            .send(Command::Request { command, payload, collect: Box::new(collect), timeout, reply })
+            .send(Command::Request {
+                command,
+                payload,
+                collect: Box::new(collect),
+                timeout,
+                reply,
+            })
             .await
             .map_err(|_| PeerError::Disconnected)?;
         answer.await.map_err(|_| PeerError::Disconnected)?
@@ -290,12 +322,20 @@ impl Actor {
         while let Some(command) = self.queue.front() {
             match command {
                 Command::Send(..) => {
-                    let Some(Command::Send(cmd, payload)) = self.queue.pop_front() else { unreachable!() };
+                    let Some(Command::Send(cmd, payload)) = self.queue.pop_front() else {
+                        unreachable!()
+                    };
                     self.write(cmd, &payload).await?;
                 }
                 Command::Request { .. } if self.current.is_some() => break,
                 Command::Request { .. } => {
-                    let Some(Command::Request { command, payload, collect, timeout, reply }) = self.queue.pop_front()
+                    let Some(Command::Request {
+                        command,
+                        payload,
+                        collect,
+                        timeout,
+                        reply,
+                    }) = self.queue.pop_front()
                     else {
                         unreachable!()
                     };
@@ -303,7 +343,8 @@ impl Actor {
                         continue;
                     }
                     self.write(command, &payload).await?;
-                    self.activity.store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    self.activity
+                        .store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
                     self.current = Some(Active {
                         command,
                         collect,
@@ -322,6 +363,11 @@ impl Actor {
         if message.command == "ping" {
             return self.write("pong", &message.payload).await;
         }
+        // A light client has no blocks to offer; nodes wait for an answer
+        // to getheaders and drop a peer that gives none.
+        if message.command == "getheaders" {
+            return self.write("headers", &[0]).await;
+        }
         if let Some(active) = self.current.as_mut() {
             match (active.collect)(&message) {
                 Step::Skip => {}
@@ -339,7 +385,10 @@ impl Actor {
         }
         if let Some(events) = &self.events {
             // A full event queue drops the message: it is only a hint.
-            let _ = events.try_send(PeerEvent { peer: self.id, message });
+            let _ = events.try_send(PeerEvent {
+                peer: self.id,
+                message,
+            });
         }
         Ok(())
     }

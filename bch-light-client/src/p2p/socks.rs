@@ -48,13 +48,20 @@ impl PeerAddr {
                 None if tail.is_empty() => default_port,
                 None => return Err(bad()),
             };
-            return Ok(Self { host: host.to_string(), port });
+            return Ok(Self {
+                host: host.to_string(),
+                port,
+            });
         }
         match s.rsplit_once(':') {
-            Some((host, port)) if !host.contains(':') => {
-                Ok(Self { host: host.to_string(), port: port.parse().map_err(|_| bad())? })
-            }
-            _ if !s.is_empty() => Ok(Self { host: s.to_string(), port: default_port }),
+            Some((host, port)) if !host.contains(':') => Ok(Self {
+                host: host.to_string(),
+                port: port.parse().map_err(|_| bad())?,
+            }),
+            _ if !s.is_empty() => Ok(Self {
+                host: s.to_string(),
+                port: default_port,
+            }),
             _ => Err(bad()),
         }
     }
@@ -74,9 +81,7 @@ pub enum Transport {
     #[default]
     Direct,
     /// Through a SOCKS5 proxy (Tor's is usually 127.0.0.1:9050).
-    Socks5 {
-        proxy: PeerAddr,
-    },
+    Socks5 { proxy: PeerAddr },
 }
 
 /// A connection that could not be made.
@@ -100,7 +105,9 @@ pub async fn connect(
 ) -> Result<TcpStream, ConnectError> {
     let attempt = async {
         match transport {
-            Transport::Direct => Ok::<_, ConnectError>(TcpStream::connect((peer.host.as_str(), peer.port)).await?),
+            Transport::Direct => {
+                Ok::<_, ConnectError>(TcpStream::connect((peer.host.as_str(), peer.port)).await?)
+            }
             Transport::Socks5 { proxy } => {
                 let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port)).await?;
                 let credentials = isolate.then(random_credentials);
@@ -109,14 +116,22 @@ pub async fn connect(
             }
         }
     };
-    let stream = tokio::time::timeout(timeout, attempt).await.map_err(|_| ConnectError::Timeout)??;
+    let stream = tokio::time::timeout(timeout, attempt)
+        .await
+        .map_err(|_| ConnectError::Timeout)??;
     stream.set_nodelay(true)?;
     Ok(stream)
 }
 
 fn random_credentials() -> (String, String) {
     let mut rng = rand::thread_rng();
-    let mut word = || (&mut rng).sample_iter(&Alphanumeric).take(16).map(char::from).collect::<String>();
+    let mut word = || {
+        (&mut rng)
+            .sample_iter(&Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect::<String>()
+    };
     (word(), word())
 }
 
@@ -154,7 +169,10 @@ async fn socks5_handshake(
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).await?;
     if head[1] != 0x00 {
-        return Err(ConnectError::Proxy(format!("connect to {peer} failed with code {}", head[1])));
+        return Err(ConnectError::Proxy(format!(
+            "connect to {peer} failed with code {}",
+            head[1]
+        )));
     }
     let skip = match head[3] {
         0x01 => 4,
@@ -174,8 +192,20 @@ mod tests {
 
     #[test]
     fn peer_addresses_parse() {
-        assert_eq!(PeerAddr::parse("127.0.0.1:8333", 1).unwrap(), PeerAddr { host: "127.0.0.1".into(), port: 8333 });
-        assert_eq!(PeerAddr::parse("[::1]:18444", 1).unwrap(), PeerAddr { host: "::1".into(), port: 18444 });
+        assert_eq!(
+            PeerAddr::parse("127.0.0.1:8333", 1).unwrap(),
+            PeerAddr {
+                host: "127.0.0.1".into(),
+                port: 8333
+            }
+        );
+        assert_eq!(
+            PeerAddr::parse("[::1]:18444", 1).unwrap(),
+            PeerAddr {
+                host: "::1".into(),
+                port: 18444
+            }
+        );
         assert_eq!(PeerAddr::parse("abc.onion", 8333).unwrap().port, 8333);
         assert!(PeerAddr::parse("host:port", 1).is_err());
     }
@@ -199,7 +229,10 @@ mod tests {
         let mut host = vec![0u8; head[4] as usize + 2];
         s.read_exact(&mut host).await.unwrap();
         s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
-        (String::from_utf8(user).unwrap(), String::from_utf8(host[..host.len() - 2].to_vec()).unwrap())
+        (
+            String::from_utf8(user).unwrap(),
+            String::from_utf8(host[..host.len() - 2].to_vec()).unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -209,9 +242,19 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let server = tokio::spawn(fake_proxy(listener));
-            let transport = Transport::Socks5 { proxy: PeerAddr { host: "127.0.0.1".into(), port } };
-            let peer = PeerAddr { host: "example.onion".into(), port: 8333 };
-            connect(&peer, &transport, true, Duration::from_secs(5)).await.unwrap();
+            let transport = Transport::Socks5 {
+                proxy: PeerAddr {
+                    host: "127.0.0.1".into(),
+                    port,
+                },
+            };
+            let peer = PeerAddr {
+                host: "example.onion".into(),
+                port: 8333,
+            };
+            connect(&peer, &transport, true, Duration::from_secs(5))
+                .await
+                .unwrap();
             let (user, host) = server.await.unwrap();
             assert_eq!(host, "example.onion");
             users.push(user);

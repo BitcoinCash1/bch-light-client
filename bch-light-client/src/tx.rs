@@ -171,7 +171,7 @@ impl TokenData {
         } else {
             0
         };
-        let nft = has_nft.then(|| Nft {
+        let nft = has_nft.then_some(Nft {
             capability: match capability {
                 1 => NftCapability::Mutable,
                 2 => NftCapability::Minting,
@@ -180,7 +180,14 @@ impl TokenData {
             commitment,
         });
         let rest = &field[1 + r.position()..];
-        Some((TokenData { category, amount, nft }, rest))
+        Some((
+            TokenData {
+                category,
+                amount,
+                nft,
+            },
+            rest,
+        ))
     }
 
     /// The serialized token prefix.
@@ -269,18 +276,33 @@ impl Transaction {
             let vout = r.u32()?;
             let script_sig = r.var_bytes()?.to_vec();
             let sequence = r.u32()?;
-            inputs.push(TxIn { prevout: OutPoint { txid, vout }, script_sig, sequence });
+            inputs.push(TxIn {
+                prevout: OutPoint { txid, vout },
+                script_sig,
+                sequence,
+            });
         }
         let n_out = r.count(9)?;
         let mut outputs = Vec::with_capacity(n_out);
         for _ in 0..n_out {
             let value = r.u64()?;
             let (token, script) = TokenData::split(r.var_bytes()?);
-            outputs.push(TxOut { value, token, script: script.to_vec() });
+            outputs.push(TxOut {
+                value,
+                token,
+                script: script.to_vec(),
+            });
         }
         let lock_time = r.u32()?;
         let raw = r.since(start);
-        Ok(Self { version, inputs, outputs, lock_time, txid: Txid(sha256d(raw)), size: raw.len() })
+        Ok(Self {
+            version,
+            inputs,
+            outputs,
+            lock_time,
+            txid: Txid(sha256d(raw)),
+            size: raw.len(),
+        })
     }
 
     /// Parses a whole serialized transaction.
@@ -349,18 +371,28 @@ mod tests {
         let script = [0xaa, 0x20, 1, 2, 3];
         let cases = [
             // fungible only
-            TokenData { category: Category(category), amount: 1_000_000, nft: None },
+            TokenData {
+                category: Category(category),
+                amount: 1_000_000,
+                nft: None,
+            },
             // immutable NFT with a commitment
             TokenData {
                 category: Category(category),
                 amount: 0,
-                nft: Some(Nft { capability: NftCapability::None, commitment: vec![1, 2, 3] }),
+                nft: Some(Nft {
+                    capability: NftCapability::None,
+                    commitment: vec![1, 2, 3],
+                }),
             },
             // minting NFT without commitment plus amount
             TokenData {
                 category: Category(category),
                 amount: 5,
-                nft: Some(Nft { capability: NftCapability::Minting, commitment: vec![] }),
+                nft: Some(Nft {
+                    capability: NftCapability::Minting,
+                    commitment: vec![],
+                }),
             },
         ];
         for token in cases {

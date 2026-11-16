@@ -27,7 +27,10 @@ pub struct Mempool {
 
 impl Mempool {
     pub fn new(max_bytes: usize) -> Self {
-        Self { max_bytes, ..Default::default() }
+        Self {
+            max_bytes,
+            ..Default::default()
+        }
     }
 
     pub fn contains(&self, txid: &Txid) -> bool {
@@ -61,12 +64,19 @@ impl Mempool {
 
     /// The value of an output of a mempool transaction.
     pub fn output_value(&self, outpoint: &OutPoint) -> Option<u64> {
-        self.txs.get(&outpoint.txid).and_then(|t| t.tx.outputs.get(outpoint.vout as usize)).map(|o| o.value)
+        self.txs
+            .get(&outpoint.txid)
+            .and_then(|t| t.tx.outputs.get(outpoint.vout as usize))
+            .map(|o| o.value)
     }
 
     /// Adds a transaction; `known_value` gives the value of confirmed
     /// outputs the client knows, for the fee. Returns false if it was there.
-    pub fn insert(&mut self, tx: Transaction, known_value: impl Fn(&OutPoint) -> Option<u64>) -> bool {
+    pub fn insert(
+        &mut self,
+        tx: Transaction,
+        known_value: impl Fn(&OutPoint) -> Option<u64>,
+    ) -> bool {
         let txid = tx.txid();
         if self.txs.contains_key(&txid) || tx.is_coinbase() {
             return false;
@@ -74,7 +84,10 @@ impl Mempool {
         let inputs: Option<u64> = tx
             .inputs
             .iter()
-            .map(|i| self.output_value(&i.prevout).or_else(|| known_value(&i.prevout)))
+            .map(|i| {
+                self.output_value(&i.prevout)
+                    .or_else(|| known_value(&i.prevout))
+            })
             .sum();
         let outputs: u64 = tx.outputs.iter().map(|o| o.value).sum();
         let fee = inputs.and_then(|i| i.checked_sub(outputs));
@@ -85,7 +98,9 @@ impl Mempool {
         self.order.push_back(txid);
         self.txs.insert(txid, Arc::new(MempoolTx { tx, fee }));
         while self.bytes > self.max_bytes {
-            let Some(oldest) = self.order.pop_front() else { break };
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
             self.remove(&oldest);
         }
         true
@@ -123,7 +138,9 @@ impl Mempool {
             if !seen.insert(txid) {
                 continue;
             }
-            let Some(entry) = self.remove(&txid) else { continue };
+            let Some(entry) = self.remove(&txid) else {
+                continue;
+            };
             for vout in 0..entry.tx.outputs.len() {
                 if let Some(child) = self.spends.get(&OutPoint::new(txid, vout as u32)) {
                     doomed.push(*child);
@@ -139,7 +156,9 @@ impl Mempool {
 
     /// Whether a mempool transaction spends an output of another mempool transaction.
     pub fn has_unconfirmed_parent(&self, tx: &Transaction) -> bool {
-        tx.inputs.iter().any(|i| self.txs.contains_key(&i.prevout.txid))
+        tx.inputs
+            .iter()
+            .any(|i| self.txs.contains_key(&i.prevout.txid))
     }
 }
 

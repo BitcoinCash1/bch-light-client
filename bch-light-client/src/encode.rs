@@ -194,7 +194,15 @@ mod tests {
 
     #[test]
     fn compact_sizes_round_trip_and_refuse_non_canonical() {
-        for v in [0u64, 0xfc, 0xfd, 0xffff, 0x1_0000, 0xffff_ffff, 0x1_0000_0000] {
+        for v in [
+            0u64,
+            0xfc,
+            0xfd,
+            0xffff,
+            0x1_0000,
+            0xffff_ffff,
+            0x1_0000_0000,
+        ] {
             let mut b = Vec::new();
             b.put_compact_size(v);
             assert_eq!(b.len(), compact_size_len(v));
@@ -202,7 +210,10 @@ mod tests {
             assert_eq!(r.compact_size().unwrap(), v);
             r.finish().unwrap();
         }
-        assert_eq!(Reader::new(&[0xfd, 0x10, 0x00]).compact_size(), Err(DecodeError::NonCanonicalSize));
+        assert_eq!(
+            Reader::new(&[0xfd, 0x10, 0x00]).compact_size(),
+            Err(DecodeError::NonCanonicalSize)
+        );
         assert!(Reader::new(&[0x05, 1, 2]).var_bytes().is_err());
     }
 }

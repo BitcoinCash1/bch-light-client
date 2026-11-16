@@ -25,7 +25,12 @@ const CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 /// Tests `keys` against the filters at `spans` (height, block hash, offset,
 /// length) of the file at `path`. A malformed filter counts as matching every
 /// key, so that it can never hide a payment.
-pub fn scan(path: &Path, spans: &[(u32, BlockHash, u64, u32)], keys: &[ScanKey], threads: usize) -> std::io::Result<ScanHits> {
+pub fn scan(
+    path: &Path,
+    spans: &[(u32, BlockHash, u64, u32)],
+    keys: &[ScanKey],
+    threads: usize,
+) -> std::io::Result<ScanHits> {
     if spans.is_empty() || keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -41,7 +46,10 @@ pub fn scan(path: &Path, spans: &[(u32, BlockHash, u64, u32)], keys: &[ScanKey],
                 s.spawn(move || scan_part(path, part, keys, keys_by_start))
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("scan thread panicked")).collect()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("scan thread panicked"))
+            .collect()
     });
     let mut hits = Vec::new();
     for part in results {
@@ -65,7 +73,9 @@ fn scan_part(
         // A run of filters that fits one read.
         let base = spans[i].2;
         let mut j = i;
-        while j + 1 < spans.len() && spans[j + 1].2 + u64::from(spans[j + 1].3) - base <= CHUNK_BYTES {
+        while j + 1 < spans.len()
+            && spans[j + 1].2 + u64::from(spans[j + 1].3) - base <= CHUNK_BYTES
+        {
             j += 1;
         }
         let size = (spans[j].2 + u64::from(spans[j].3) - base) as usize;
@@ -83,7 +93,11 @@ fn scan_part(
                 Ok(gcs) => {
                     let sip = filter_key(&hash.0);
                     targets.clear();
-                    targets.extend(keys_by_start[..active].iter().map(|&k| (hash_to_range(sip, gcs.n, &keys[k].key.0), k)));
+                    targets.extend(
+                        keys_by_start[..active]
+                            .iter()
+                            .map(|&k| (hash_to_range(sip, gcs.n, &keys[k].key.0), k)),
+                    );
                     targets.sort_unstable();
                     if gcs.match_sorted(&targets, |k| matched.push(k)).is_err() {
                         matched = keys_by_start[..active].to_vec();
@@ -109,7 +123,8 @@ mod tests {
 
     #[test]
     fn finds_each_key_in_its_blocks_from_its_start_height() {
-        let dir = std::env::temp_dir().join(format!("bch-light-client-test-{}-scan", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("bch-light-client-test-{}-scan", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("filters.dat");
         let keys: Vec<FilterKey> = (0u8..4).map(|i| FilterKey([i; 32])).collect();
@@ -118,7 +133,9 @@ mod tests {
         for height in 0u32..200 {
             let hash = BlockHash(crate::hash::sha256d(&height.to_le_bytes()));
             // Key i is in the blocks whose height is a multiple of i + 2.
-            let mut items: Vec<Vec<u8>> = (0..50u32).map(|j| crate::hash::sha256(&(height * 1000 + j).to_le_bytes()).to_vec()).collect();
+            let mut items: Vec<Vec<u8>> = (0..50u32)
+                .map(|j| crate::hash::sha256(&(height * 1000 + j).to_le_bytes()).to_vec())
+                .collect();
             for (i, k) in keys.iter().enumerate() {
                 if height % (i as u32 + 2) == 0 {
                     items.push(k.0.to_vec());
@@ -131,12 +148,25 @@ mod tests {
             data.extend(filter);
         }
         std::fs::write(&path, &data).unwrap();
-        let scan_keys: Vec<ScanKey> = keys.iter().enumerate().map(|(i, k)| ScanKey { key: *k, from: i as u32 * 10 }).collect();
+        let scan_keys: Vec<ScanKey> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ScanKey {
+                key: *k,
+                from: i as u32 * 10,
+            })
+            .collect();
         for threads in [1, 3, 8] {
             let hits = scan(&path, &spans, &scan_keys, threads).unwrap();
             for (i, _) in keys.iter().enumerate() {
-                let found: Vec<u32> = hits.iter().filter(|(_, ks)| ks.contains(&i)).map(|(h, _)| *h).collect();
-                let expected: Vec<u32> = (i as u32 * 10..200).filter(|h| h % (i as u32 + 2) == 0).collect();
+                let found: Vec<u32> = hits
+                    .iter()
+                    .filter(|(_, ks)| ks.contains(&i))
+                    .map(|(h, _)| *h)
+                    .collect();
+                let expected: Vec<u32> = (i as u32 * 10..200)
+                    .filter(|h| h % (i as u32 + 2) == 0)
+                    .collect();
                 assert_eq!(found, expected, "key {i} with {threads} threads");
             }
         }

@@ -54,6 +54,14 @@
 //! - Peer host names go to the proxy unresolved; the client makes no DNS
 //!   lookups of its own through a proxy.
 
+// `is_multiple_of` and `as_chunks` are newer than the Rust some wallets
+// that embed this library build with.
+#![allow(
+    unknown_lints,
+    clippy::manual_is_multiple_of,
+    clippy::chunks_exact_with_const_size
+)]
+
 pub mod block;
 pub mod cashaddr;
 pub mod chain;
@@ -74,8 +82,8 @@ pub mod scan;
 pub mod tx;
 
 pub use client::{
-    Balance, Config, Confirmation, Event, FeeEstimate, History, LightClient, MempoolEntry, MempoolSummary,
-    MerkleProof, OutputInfo, Status, TokenFilter, TxInfo, Utxo,
+    Balance, Config, Confirmation, Event, FeeEstimate, History, LightClient, MempoolEntry,
+    MempoolSummary, MerkleProof, OutputInfo, Status, TokenFilter, TxInfo, Utxo,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use hash::{BlockHash, Txid};

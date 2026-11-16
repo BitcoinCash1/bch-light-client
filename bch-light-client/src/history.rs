@@ -18,15 +18,27 @@ pub enum Target {
     /// A locking script (bare, without token prefix): P2PKH, P2SH20, P2SH32,
     /// a bare pay-to-script output, anything a wallet derives.
     Script(Vec<u8>),
+    /// A locking script known only by its SHA-256, which is its filter key.
+    ScriptHash([u8; 32]),
     /// Every output that carries a token category.
     Category(Category),
 }
 
 impl Target {
+    /// The script a CashAddr address of `network` pays to.
+    pub fn address(
+        address: &str,
+        network: crate::params::Network,
+    ) -> Result<Self, crate::cashaddr::AddressError> {
+        let decoded = crate::cashaddr::Address::decode(address, network.params().cashaddr_prefix)?;
+        Ok(Target::Script(decoded.script()))
+    }
+
     /// The filter key of the target.
     pub fn key(&self) -> FilterKey {
         match self {
             Target::Script(script) => FilterKey::script(script),
+            Target::ScriptHash(hash) => FilterKey(*hash),
             Target::Category(category) => FilterKey::category(category),
         }
     }
@@ -35,20 +47,11 @@ impl Target {
     pub fn owns(&self, output: &TxOut) -> bool {
         match self {
             Target::Script(script) => output.script == *script,
-            Target::Category(category) => output.token.as_ref().is_some_and(|t| t.category == *category),
-        }
-    }
-
-    /// The Electrum-style script hash of a script target: SHA-256 of the
-    /// script, bytes reversed, as hex.
-    pub fn script_hash_hex(&self) -> Option<String> {
-        match self {
-            Target::Script(script) => {
-                let mut h = crate::hash::sha256(script);
-                h.reverse();
-                Some(hex::encode(h))
-            }
-            Target::Category(_) => None,
+            Target::ScriptHash(hash) => crate::hash::sha256(&output.script) == *hash,
+            Target::Category(category) => output
+                .token
+                .as_ref()
+                .is_some_and(|t| t.category == *category),
         }
     }
 }
@@ -113,7 +116,14 @@ pub struct TargetState {
 impl TargetState {
     pub fn new(target: Target) -> Self {
         let key = target.key();
-        Self { target, key, synced_to: None, txs: Vec::new(), coins: HashMap::new(), spent_by: HashMap::new() }
+        Self {
+            target,
+            key,
+            synced_to: None,
+            txs: Vec::new(),
+            coins: HashMap::new(),
+            spent_by: HashMap::new(),
+        }
     }
 
     /// The first height not yet applied.
@@ -151,20 +161,28 @@ impl TargetState {
                             height,
                         },
                     );
-                    entries.get_mut(&pos).expect("just added").received.push(Received {
-                        vout: vout as u32,
-                        value: output.value,
-                        token: output.token.clone(),
-                        script: output.script.clone(),
-                    });
+                    entries
+                        .get_mut(&pos)
+                        .expect("just added")
+                        .received
+                        .push(Received {
+                            vout: vout as u32,
+                            value: output.value,
+                            token: output.token.clone(),
+                            script: output.script.clone(),
+                        });
                 }
             }
         }
         for (pos, tx) in txs.iter().enumerate().skip(1) {
             for (vin, input) in tx.inputs.iter().enumerate() {
                 if let Some(coin) = self.coins.get(&input.prevout) {
-                    let spent =
-                        Spent { vin: vin as u32, prevout: input.prevout, value: coin.value, token: coin.token.clone() };
+                    let spent = Spent {
+                        vin: vin as u32,
+                        prevout: input.prevout,
+                        value: coin.value,
+                        token: coin.token.clone(),
+                    };
                     self.spent_by.insert(input.prevout, (tx.txid(), height));
                     entry(&mut entries, pos, tx);
                     entries.get_mut(&pos).expect("just added").spent.push(spent);
@@ -180,7 +198,7 @@ impl TargetState {
 
     /// Forgets every block above `fork`. Returns whether the history changed.
     pub fn rollback(&mut self, fork: u32) -> bool {
-        if self.synced_to.map_or(true, |h| h <= fork) {
+        if !matches!(self.synced_to, Some(h) if h > fork) {
             return false;
         }
         self.synced_to = Some(fork);
@@ -193,7 +211,9 @@ impl TargetState {
 
     /// Confirmed coins no confirmed transaction spent.
     pub fn unspent(&self) -> impl Iterator<Item = &Coin> {
-        self.coins.values().filter(|c| !self.spent_by.contains_key(&c.outpoint))
+        self.coins
+            .values()
+            .filter(|c| !self.spent_by.contains_key(&c.outpoint))
     }
 }
 
@@ -202,7 +222,11 @@ mod tests {
     use super::*;
     use crate::tx::{Nft, NftCapability, TxIn};
 
-    fn tx(inputs: &[OutPoint], outputs: &[(u64, &[u8], Option<TokenData>)], salt: u32) -> Transaction {
+    fn tx(
+        inputs: &[OutPoint],
+        outputs: &[(u64, &[u8], Option<TokenData>)],
+        salt: u32,
+    ) -> Transaction {
         let mut b = Vec::new();
         use crate::encode::WriteExt;
         b.put_i32(2);
@@ -222,7 +246,11 @@ mod tests {
         b.put_compact_size(outputs.len() as u64);
         for (value, script, token) in outputs {
             b.put_u64(*value);
-            let out = TxOut { value: *value, token: token.clone(), script: script.to_vec() };
+            let out = TxOut {
+                value: *value,
+                token: token.clone(),
+                script: script.to_vec(),
+            };
             b.put_var_bytes(&out.script_field());
         }
         b.put_u32(0);
@@ -239,10 +267,18 @@ mod tests {
         assert!(state.apply_block(1, BlockHash([1; 32]), &b1));
         // In block 2 a transaction spends the coinbase output and pays the
         // script again, and a later one in the same block spends that.
-        let spend = tx(&[OutPoint::new(coinbase.txid(), 0)], &[(4000, script, None), (900, other, None)], 2);
+        let spend = tx(
+            &[OutPoint::new(coinbase.txid(), 0)],
+            &[(4000, script, None), (900, other, None)],
+            2,
+        );
         let respend = tx(&[OutPoint::new(spend.txid(), 0)], &[(3900, other, None)], 3);
         let cb2 = tx(&[], &[(1, other, None)], 4);
-        assert!(state.apply_block(2, BlockHash([2; 32]), &[cb2, respend.clone(), spend.clone()]));
+        assert!(state.apply_block(
+            2,
+            BlockHash([2; 32]),
+            &[cb2, respend.clone(), spend.clone()]
+        ));
         assert_eq!(state.txs.len(), 3);
         assert_eq!(state.unspent().count(), 0);
         let in_block2: Vec<&ConfirmedTx> = state.txs.iter().filter(|t| t.height == 2).collect();
@@ -263,15 +299,26 @@ mod tests {
         let nft = TokenData {
             category,
             amount: 0,
-            nft: Some(Nft { capability: NftCapability::Mutable, commitment: vec![1] }),
+            nft: Some(Nft {
+                capability: NftCapability::Mutable,
+                commitment: vec![1],
+            }),
         };
         let mut state = TargetState::new(Target::Category(category));
         let a: &[u8] = &[0xa9, 0x14, 9, 0x87];
         let b: &[u8] = &[0x76, 0xa9];
-        let mint = tx(&[OutPoint::new(Txid([3; 32]), 0)], &[(1000, a, Some(nft.clone())), (500, a, None)], 1);
+        let mint = tx(
+            &[OutPoint::new(Txid([3; 32]), 0)],
+            &[(1000, a, Some(nft.clone())), (500, a, None)],
+            1,
+        );
         let cb = tx(&[], &[(1, b, None)], 9);
         assert!(state.apply_block(5, BlockHash([5; 32]), &[cb, mint.clone()]));
-        let moved = tx(&[OutPoint::new(mint.txid(), 0)], &[(900, b, Some(nft.clone()))], 2);
+        let moved = tx(
+            &[OutPoint::new(mint.txid(), 0)],
+            &[(900, b, Some(nft.clone()))],
+            2,
+        );
         let cb = tx(&[], &[(1, b, None)], 10);
         assert!(state.apply_block(6, BlockHash([6; 32]), &[cb, moved.clone()]));
         let unspent: Vec<&Coin> = state.unspent().collect();
@@ -279,6 +326,10 @@ mod tests {
         assert_eq!(unspent[0].outpoint, OutPoint::new(moved.txid(), 0));
         assert_eq!(unspent[0].script, b);
         assert_eq!(unspent[0].token.as_ref(), Some(&nft));
-        let _ = TxIn { prevout: OutPoint::new(Txid::ZERO, 0), script_sig: vec![], sequence: 0 };
+        let _ = TxIn {
+            prevout: OutPoint::new(Txid::ZERO, 0),
+            script_sig: vec![],
+            sequence: 0,
+        };
     }
 }

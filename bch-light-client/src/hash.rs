@@ -119,11 +119,15 @@ mod tests {
 
     #[test]
     fn display_order_round_trips() {
-        let h = BlockHash::from_hex("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-            .unwrap();
+        let h =
+            BlockHash::from_hex("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .unwrap();
         assert_eq!(h.0[31], 0);
         assert_eq!(h.0[0], 0x6f);
-        assert_eq!(h.to_string(), "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f");
+        assert_eq!(
+            h.to_string(),
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+        );
         assert!(Txid::from_hex("00").is_err());
     }
 }

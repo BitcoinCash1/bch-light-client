@@ -51,9 +51,18 @@ impl FilterStore {
     /// filter headers.
     pub fn open(dir: &Path, hash_at: impl Fn(u32) -> Option<BlockHash>) -> std::io::Result<Self> {
         let data_path = dir.join("filters.dat");
-        let mut data = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&data_path)?;
-        let mut index =
-            OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join("filter-index.dat"))?;
+        let mut data = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&data_path)?;
+        let mut index = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("filter-index.dat"))?;
         let mut records = Vec::new();
         index.read_to_end(&mut records)?;
         let data_len = data.seek(SeekFrom::End(0))?;
@@ -85,7 +94,11 @@ impl FilterStore {
         let mut keep = count;
         for height in count.saturating_sub(16)..count {
             let ok = store.read(height as u32).map(|f| {
-                let prev = if height == 0 { [0u8; 32] } else { store.headers[height - 1] };
+                let prev = if height == 0 {
+                    [0u8; 32]
+                } else {
+                    store.headers[height - 1]
+                };
                 next_filter_header(&f, &prev) == store.headers[height]
             });
             if !matches!(ok, Ok(true)) {
@@ -122,7 +135,16 @@ impl FilterStore {
     /// The location of each filter of heights [from, to).
     pub fn spans(&self, from: u32, to: u32) -> Vec<(u32, BlockHash, u64, u32)> {
         let to = (to as usize).min(self.len());
-        (from as usize..to).map(|h| (h as u32, self.block_hashes[h], self.offsets[h], self.lengths[h])).collect()
+        (from as usize..to)
+            .map(|h| {
+                (
+                    h as u32,
+                    self.block_hashes[h],
+                    self.offsets[h],
+                    self.lengths[h],
+                )
+            })
+            .collect()
     }
 
     pub fn data_path(&self) -> &Path {
@@ -131,8 +153,13 @@ impl FilterStore {
 
     /// Appends filters for the heights after the tip, all checked by the caller.
     pub fn append(&mut self, items: &[(BlockHash, [u8; 32], Vec<u8>)]) -> std::io::Result<()> {
-        let mut offset = self.offsets.last().map_or(0, |o| o + u64::from(*self.lengths.last().expect("same length")));
-        let blob: Vec<u8> = items.iter().flat_map(|(_, _, f)| f.iter().copied()).collect();
+        let mut offset = self.offsets.last().map_or(0, |o| {
+            o + u64::from(*self.lengths.last().expect("same length"))
+        });
+        let blob: Vec<u8> = items
+            .iter()
+            .flat_map(|(_, _, f)| f.iter().copied())
+            .collect();
         let mut records = Vec::with_capacity(items.len() * RECORD);
         for (hash, header, filter) in items {
             records.extend_from_slice(&hash.0);
@@ -142,7 +169,8 @@ impl FilterStore {
         self.data.seek(SeekFrom::Start(offset))?;
         self.data.write_all(&blob)?;
         self.data.flush()?;
-        self.index.seek(SeekFrom::Start((self.len() * RECORD) as u64))?;
+        self.index
+            .seek(SeekFrom::Start((self.len() * RECORD) as u64))?;
         self.index.write_all(&records)?;
         self.index.flush()?;
         for (hash, header, filter) in items {
@@ -158,7 +186,11 @@ impl FilterStore {
     /// Keeps heights [0, count).
     pub fn truncate(&mut self, count: u32) -> std::io::Result<()> {
         let count = (count as usize).min(self.len());
-        let end = if count == 0 { 0 } else { self.offsets[count - 1] + u64::from(self.lengths[count - 1]) };
+        let end = if count == 0 {
+            0
+        } else {
+            self.offsets[count - 1] + u64::from(self.lengths[count - 1])
+        };
         self.block_hashes.truncate(count);
         self.headers.truncate(count);
         self.offsets.truncate(count);
@@ -182,9 +214,16 @@ impl FilterStore {
     pub fn read_checked(&self, height: u32) -> std::io::Result<Vec<u8>> {
         let filter = self.read(height)?;
         let h = height as usize;
-        let prev = if h == 0 { [0u8; 32] } else { self.headers[h - 1] };
+        let prev = if h == 0 {
+            [0u8; 32]
+        } else {
+            self.headers[h - 1]
+        };
         if next_filter_header(&filter, &prev) != self.headers[h] {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "stored filter does not match its header"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stored filter does not match its header",
+            ));
         }
         Ok(filter)
     }
@@ -202,7 +241,10 @@ mod tests {
 
     #[test]
     fn appends_reloads_and_truncates() {
-        let dir = std::env::temp_dir().join(format!("bch-light-client-test-{}-filters", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "bch-light-client-test-{}-filters",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let hashes: Vec<BlockHash> = (0u8..5).map(|i| BlockHash([i; 32])).collect();
