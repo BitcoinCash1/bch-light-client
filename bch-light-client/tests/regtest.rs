@@ -510,7 +510,13 @@ async fn measure_sync_and_lookups() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3000);
-    let node = Bchd::start("measure").await;
+    // MEASURE_BCHD=txid measures against a bchd whose filters hold transaction keys.
+    let bin = if std::env::var("MEASURE_BCHD").as_deref() == Ok("txid") {
+        bchd_txid_binary().expect("bchd with transaction keys")
+    } else {
+        bchd_binary().unwrap()
+    };
+    let node = Bchd::start_with(&bin, "measure").await;
     let started = Instant::now();
     let mut made = 0;
     while made < blocks {
@@ -522,6 +528,7 @@ async fn measure_sync_and_lookups() {
     // A few payments to one P2PKH script spread over the chain.
     let key = Key::new(9);
     let p2pkh = key.script();
+    let mut payments = Vec::new();
     for i in 0..5u32 {
         let (cb, v) = node.coinbase(1 + i).await;
         let tx = TxSpec {
@@ -533,6 +540,7 @@ async fn measure_sync_and_lookups() {
         }
         .build();
         node.send(&tx).await;
+        payments.push(txid_of(&tx));
         node.generate(1).await;
     }
     let tip = node.height().await;
@@ -548,6 +556,13 @@ async fn measure_sync_and_lookups() {
     let headers = started.elapsed();
     client.wait_synced(Duration::from_secs(600)).await.unwrap();
     let filters = started.elapsed();
+    let by_id = if client.status().txid_keys == Some(true) {
+        let t = Instant::now();
+        let found = client.transaction(payments[2], None).await.unwrap();
+        format!("lookup by ID alone={:?} [height {}]", t.elapsed(), found.confirmation.unwrap().height)
+    } else {
+        "no transaction keys in these filters".to_string()
+    };
     let t = Instant::now();
     let few = client.history(&Target::Script(p2pkh)).await.unwrap();
     let few_time = t.elapsed();
@@ -565,7 +580,7 @@ async fn measure_sync_and_lookups() {
     let again_time = t.elapsed();
     eprintln!(
         "MEASURE tip={tip} headers={headers:?} headers+filters={filters:?} \
-         first lookup (5 txs)={few_time:?} [{}] first lookup (one per block, {} txs)={every_time:?} cached balance={again_time:?} [{}]",
+         first lookup (5 txs)={few_time:?} [{}] first lookup (one per block, {} txs)={every_time:?} cached balance={again_time:?} [{}] {by_id}",
         few.confirmed.len(),
         every.confirmed.len(),
         again.confirmed
@@ -603,4 +618,34 @@ async fn service_connection_stays_up_when_idle() {
         "the service connection was dropped and made again"
     );
     client.shutdown();
+}
+
+/// Every mainnet header from genesis through the old rules, the emergency
+/// adjustment, the DAA and aserti3-2d, from a public node (whose lack of
+/// script filters only stops the filter sync). Set MAINNET_PEER to a node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "downloads about 76 MB of mainnet headers; run with --ignored"]
+async fn mainnet_headers_follow_the_difficulty_rules() {
+    init_tracing();
+    let peer = std::env::var("MAINNET_PEER").unwrap_or_else(|_| "seed.bchd.cash:8333".into());
+    let dir = std::env::temp_dir().join(format!("bch-light-client-mainnet-{}", std::process::id()));
+    let mut config = Config::new(Network::Mainnet, &dir, vec![peer]);
+    config.request_timeout = Duration::from_secs(60);
+    let client = LightClient::start(config).await.unwrap();
+    let started = Instant::now();
+    let mut last = 0;
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let height = client.status().header_height;
+        eprintln!("mainnet headers: {height} after {:?}", started.elapsed());
+        if height > 940_000 && height == last {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(1800), "headers stalled at {height}");
+        last = height;
+    }
+    let tip = client.header(last).unwrap();
+    eprintln!("MAINNET headers={last} tip={} time={:?}", tip.hash(), started.elapsed());
+    client.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }
