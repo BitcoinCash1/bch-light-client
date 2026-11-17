@@ -101,6 +101,68 @@ fn size_bits(len: usize) -> Option<u8> {
     }
 }
 
+fn checksum_input<'a>(prefix: &'a str, data: &'a [u8]) -> impl Iterator<Item = u8> + 'a {
+    prefix
+        .bytes()
+        .map(|b| b & 0x1f)
+        .chain([0])
+        .chain(data.iter().copied())
+}
+
+/// Encodes a CashAddr string from its parts: the prefix, the type (the upper
+/// bits of the version byte, 0 to 15, of which 0 to 3 are defined) and a
+/// payload of 20, 24, 28, 32, 40, 48, 56 or 64 bytes.
+pub fn encode(prefix: &str, kind: u8, payload: &[u8]) -> Result<String, AddressError> {
+    if kind > 15 {
+        return Err(AddressError::Version);
+    }
+    let size = size_bits(payload.len()).ok_or(AddressError::Length)?;
+    let mut bytes = vec![(kind << 3) | size];
+    bytes.extend_from_slice(payload);
+    let mut data = convert_bits(&bytes, 8, 5, true).expect("8-bit input");
+    let checksum = polymod(checksum_input(prefix, &data).chain([0u8; 8]));
+    data.extend((0..8).map(|i| ((checksum >> (5 * (7 - i))) & 0x1f) as u8));
+    let body: String = data.iter().map(|&d| CHARSET[d as usize] as char).collect();
+    Ok(format!("{prefix}:{body}"))
+}
+
+/// Decodes a CashAddr string into its type and payload. The string may omit
+/// the prefix; when it has one, it must be `prefix`.
+pub fn decode(s: &str, prefix: &str) -> Result<(u8, Vec<u8>), AddressError> {
+    let has_lower = s.bytes().any(|b| b.is_ascii_lowercase());
+    let has_upper = s.bytes().any(|b| b.is_ascii_uppercase());
+    if has_lower && has_upper {
+        return Err(AddressError::MixedCase);
+    }
+    let s = s.to_ascii_lowercase();
+    let body = match s.split_once(':') {
+        Some((p, body)) if p == prefix => body,
+        Some(_) => {
+            return Err(AddressError::Prefix {
+                expected: prefix.to_string(),
+            })
+        }
+        None => s.as_str(),
+    };
+    let data: Vec<u8> = body
+        .bytes()
+        .map(|c| CHARSET.iter().position(|&x| x == c).map(|p| p as u8))
+        .collect::<Option<_>>()
+        .ok_or(AddressError::Charset)?;
+    if data.len() < 8 || polymod(checksum_input(prefix, &data)) != 0 {
+        return Err(AddressError::Checksum);
+    }
+    let bytes = convert_bits(&data[..data.len() - 8], 5, 8, false).ok_or(AddressError::Checksum)?;
+    let (&version, payload) = bytes.split_first().ok_or(AddressError::Length)?;
+    if version & 0x80 != 0 {
+        return Err(AddressError::Version);
+    }
+    if size_bits(payload.len()) != Some(version & 0x07) {
+        return Err(AddressError::Length);
+    }
+    Ok((version >> 3, payload.to_vec()))
+}
+
 impl Address {
     /// The locking script the address pays to.
     pub fn script(&self) -> Vec<u8> {
@@ -143,86 +205,36 @@ impl Address {
         })
     }
 
-    /// Encodes the address with `prefix` (e.g. "bitcoincash").
-    pub fn encode(&self, prefix: &str) -> String {
+    /// Encodes the address with `prefix` (e.g. "bitcoincash"); refused when
+    /// the hash has no length CashAddr can encode.
+    pub fn encode(&self, prefix: &str) -> Result<String, AddressError> {
         let kind = match (self.kind, self.token_aware) {
             (AddressKind::P2pkh, false) => 0u8,
             (AddressKind::P2sh, false) => 1,
             (AddressKind::P2pkh, true) => 2,
             (AddressKind::P2sh, true) => 3,
         };
-        let version = (kind << 3) | size_bits(self.hash.len()).unwrap_or(0);
-        let mut payload = vec![version];
-        payload.extend_from_slice(&self.hash);
-        let mut data = convert_bits(&payload, 8, 5, true).expect("8-bit input");
-        let checksum = polymod(
-            prefix
-                .bytes()
-                .map(|b| b & 0x1f)
-                .chain([0])
-                .chain(data.iter().copied())
-                .chain([0u8; 8]),
-        );
-        data.extend((0..8).map(|i| ((checksum >> (5 * (7 - i))) & 0x1f) as u8));
-        let body: String = data.iter().map(|&d| CHARSET[d as usize] as char).collect();
-        format!("{prefix}:{body}")
+        encode(prefix, kind, &self.hash)
     }
 
-    /// Decodes an address of the network with `prefix`; the prefix may be omitted.
+    /// Decodes an address of the network with `prefix`; the prefix may be
+    /// omitted. Only addresses with a standard locking script decode: types
+    /// 0 to 3, with a 20-byte hash, or a 32-byte one for P2SH.
     pub fn decode(s: &str, prefix: &str) -> Result<Self, AddressError> {
-        let has_lower = s.bytes().any(|b| b.is_ascii_lowercase());
-        let has_upper = s.bytes().any(|b| b.is_ascii_uppercase());
-        if has_lower && has_upper {
-            return Err(AddressError::MixedCase);
-        }
-        let s = s.to_ascii_lowercase();
-        let body = match s.split_once(':') {
-            Some((p, body)) if p == prefix => body,
-            Some(_) => {
-                return Err(AddressError::Prefix {
-                    expected: prefix.to_string(),
-                })
-            }
-            None => s.as_str(),
-        };
-        let data: Vec<u8> = body
-            .bytes()
-            .map(|c| CHARSET.iter().position(|&x| x == c).map(|p| p as u8))
-            .collect::<Option<_>>()
-            .ok_or(AddressError::Charset)?;
-        if data.len() < 8
-            || polymod(
-                prefix
-                    .bytes()
-                    .map(|b| b & 0x1f)
-                    .chain([0])
-                    .chain(data.iter().copied()),
-            ) != 0
-        {
-            return Err(AddressError::Checksum);
-        }
-        let payload =
-            convert_bits(&data[..data.len() - 8], 5, 8, false).ok_or(AddressError::Checksum)?;
-        let (&version, hash) = payload.split_first().ok_or(AddressError::Length)?;
-        if version & 0x80 != 0 {
-            return Err(AddressError::Version);
-        }
-        let (kind, token_aware) = match version >> 3 {
+        let (kind, hash) = decode(s, prefix)?;
+        let (kind, token_aware) = match kind {
             0 => (AddressKind::P2pkh, false),
             1 => (AddressKind::P2sh, false),
             2 => (AddressKind::P2pkh, true),
             3 => (AddressKind::P2sh, true),
             _ => return Err(AddressError::Version),
         };
-        let size = version & 0x07;
-        if size_bits(hash.len()) != Some(size)
-            || !(hash.len() == 20 || (hash.len() == 32 && kind == AddressKind::P2sh))
-        {
+        if !(hash.len() == 20 || (hash.len() == 32 && kind == AddressKind::P2sh)) {
             return Err(AddressError::Length);
         }
         Ok(Self {
             kind,
-            hash: hash.to_vec(),
+            hash,
             token_aware,
         })
     }
@@ -230,7 +242,7 @@ impl Address {
 
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.encode("bitcoincash"))
+        f.write_str(&self.encode("bitcoincash").map_err(|_| fmt::Error)?)
     }
 }
 
@@ -250,10 +262,10 @@ mod tests {
             (a.kind, a.hash.clone(), a.token_aware),
             (AddressKind::P2pkh, hash.clone(), false)
         );
-        assert_eq!(a.encode("bitcoincash"), p2pkh);
+        assert_eq!(a.encode("bitcoincash").unwrap(), p2pkh);
         let b = Address::decode(p2sh, "bchtest").unwrap();
         assert_eq!((b.kind, b.hash.clone()), (AddressKind::P2sh, hash));
-        assert_eq!(b.encode("bchtest"), p2sh);
+        assert_eq!(b.encode("bchtest").unwrap(), p2sh);
         assert!(Address::decode(p2pkh, "bchtest").is_err());
         assert!(Address::decode(
             "bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg3",
@@ -271,7 +283,7 @@ mod tests {
             s
         };
         let a = Address::from_script(&script, true).unwrap();
-        let text = a.encode("bitcoincash");
+        let text = a.encode("bitcoincash").unwrap();
         let back = Address::decode(&text, "bitcoincash").unwrap();
         assert_eq!(back, a);
         assert_eq!(back.script(), script);
@@ -287,5 +299,95 @@ mod tests {
             ripemd::Ripemd160::digest(sha).to_vec()
         };
         assert_eq!(mine.hash, redeem_hash);
+    }
+
+    /// The CashAddr vectors of bitauth/libauth (MIT License, copyright Jason
+    /// Dreyzehner; tests/data/libauth/LICENSE), src/lib/address/fixtures/
+    /// cashaddr.json, as copied into mainnet-pat/libauth-rs at be3ed163:
+    /// every type and payload size the format has, under five prefixes.
+    #[test]
+    fn libauth_vectors_encode_and_decode_exactly() {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/libauth/cashaddr.json"
+        ))
+        .expect("vectors");
+        let vectors: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let vectors = vectors.as_array().unwrap();
+        assert_eq!(vectors.len(), 67);
+        for v in vectors {
+            let cashaddr = v["cashaddr"].as_str().unwrap();
+            let kind = v["type"].as_u64().unwrap() as u8;
+            let payload = hex::decode(v["payload"].as_str().unwrap()).unwrap();
+            assert_eq!(payload.len() as u64, v["payloadSize"].as_u64().unwrap());
+            let (prefix, body) = cashaddr.split_once(':').unwrap();
+            assert_eq!(encode(prefix, kind, &payload).as_deref(), Ok(cashaddr));
+            assert_eq!(
+                decode(cashaddr, prefix),
+                Ok((kind, payload.clone())),
+                "{cashaddr}"
+            );
+            // Without the prefix, and in upper case, it is the same address.
+            assert_eq!(
+                decode(body, prefix),
+                Ok((kind, payload.clone())),
+                "{cashaddr}"
+            );
+            assert_eq!(
+                decode(&cashaddr.to_ascii_uppercase(), prefix),
+                Ok((kind, payload.clone())),
+                "{cashaddr}"
+            );
+            // An address with a standard locking script decodes as one.
+            let standard =
+                kind <= 3 && (payload.len() == 20 || (payload.len() == 32 && kind % 2 == 1));
+            match Address::decode(cashaddr, prefix) {
+                Ok(a) => {
+                    assert!(standard, "{cashaddr}");
+                    assert_eq!(a.hash, payload);
+                    assert_eq!(a.token_aware, kind >= 2);
+                    assert_eq!(a.encode(prefix).as_deref(), Ok(cashaddr));
+                }
+                Err(e) => assert!(!standard, "{cashaddr}: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_strings_are_refused() {
+        let good = "bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2";
+        assert_eq!(
+            decode(
+                "bitcoincash:Qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg2",
+                "bitcoincash"
+            ),
+            Err(AddressError::MixedCase)
+        );
+        assert_eq!(
+            decode(
+                "bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg3",
+                "bitcoincash"
+            ),
+            Err(AddressError::Checksum)
+        );
+        assert_eq!(
+            decode(
+                "bitcoincash:qr6m7j9njldwwzlg9v7v53unlr4jkmx6eylep8ekg1",
+                "bitcoincash"
+            ),
+            Err(AddressError::Charset)
+        );
+        assert!(matches!(
+            decode(good, "bchtest"),
+            Err(AddressError::Prefix { .. })
+        ));
+        assert_eq!(
+            encode("bitcoincash", 16, &[0; 20]),
+            Err(AddressError::Version)
+        );
+        assert_eq!(
+            encode("bitcoincash", 0, &[0; 21]),
+            Err(AddressError::Length)
+        );
     }
 }

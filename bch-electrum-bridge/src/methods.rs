@@ -221,8 +221,10 @@ fn verbose_tx(
         .map(|(n, o)| {
             let mut spk =
                 json!({"asm": "", "hex": hex::encode(&o.script), "type": script_type(&o.script)});
-            if let Ok(address) = Address::from_script(&o.script, o.token.is_some()) {
-                spk["addresses"] = json!([address.encode(prefix)]);
+            if let Ok(address) =
+                Address::from_script(&o.script, o.token.is_some()).and_then(|a| a.encode(prefix))
+            {
+                spk["addresses"] = json!([address]);
             }
             let mut out = json!({"value": o.value as f64 / 1e8, "n": n, "scriptPubKey": spk});
             if let Some(token) = &o.token {

@@ -278,7 +278,8 @@ async fn electrum_answers_match_bchd() {
     // The NFT at the P2SH32 output, by its token-aware CashAddr.
     let address = Address::from_script(&holder, true)
         .unwrap()
-        .encode("bchreg");
+        .encode("bchreg")
+        .unwrap();
     let unspent = w
         .call(
             "blockchain.address.listunspent",
