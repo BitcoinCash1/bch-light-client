@@ -559,7 +559,11 @@ async fn measure_sync_and_lookups() {
     let by_id = if client.status().txid_keys == Some(true) {
         let t = Instant::now();
         let found = client.transaction(payments[2], None).await.unwrap();
-        format!("lookup by ID alone={:?} [height {}]", t.elapsed(), found.confirmation.unwrap().height)
+        format!(
+            "lookup by ID alone={:?} [height {}]",
+            t.elapsed(),
+            found.confirmation.unwrap().height
+        )
     } else {
         "no transaction keys in these filters".to_string()
     };
@@ -641,11 +645,18 @@ async fn mainnet_headers_follow_the_difficulty_rules() {
         if height > 940_000 && height == last {
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(1800), "headers stalled at {height}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1800),
+            "headers stalled at {height}"
+        );
         last = height;
     }
     let tip = client.header(last).unwrap();
-    eprintln!("MAINNET headers={last} tip={} time={:?}", tip.hash(), started.elapsed());
+    eprintln!(
+        "MAINNET headers={last} tip={} time={:?}",
+        tip.hash(),
+        started.elapsed()
+    );
     client.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

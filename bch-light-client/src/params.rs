@@ -73,6 +73,10 @@ pub struct Params {
     pub genesis_header: &'static str,
     pub pow_limit_bits: u32,
     pub uahf_height: u32,
+    /// From this height on transactions under 100 bytes, and so 64-byte ones, are invalid.
+    pub magnetic_anomaly_height: u32,
+    /// Where wallets on reusable payment addresses start looking by default.
+    pub rpa_start_height: u32,
     pub daa_height: u32,
     /// Blocks above this height use aserti3-2d.
     pub asert_activation_height: u32,
@@ -85,6 +89,8 @@ pub struct Params {
     /// Block hashes at fixed heights, display order.
     pub checkpoints: &'static [(u32, &'static str)],
     pub cashaddr_prefix: &'static str,
+    /// DNS seeds that list nodes of the network.
+    pub dns_seeds: &'static [&'static str],
 }
 
 impl Params {
@@ -202,6 +208,8 @@ pub static MAINNET: Params = Params {
     genesis_header: genesis!("29ab5f49ffff001d1dac2b7c"),
     pow_limit_bits: 0x1d00ffff,
     uahf_height: 478558,
+    magnetic_anomaly_height: 556766,
+    rpa_start_height: 825000,
     daa_height: 504031,
     asert_activation_height: 661647,
     asert_anchor_height: 661647,
@@ -212,6 +220,14 @@ pub static MAINNET: Params = Params {
     no_difficulty_adjustment: false,
     checkpoints: MAINNET_CHECKPOINTS,
     cashaddr_prefix: "bitcoincash",
+    dns_seeds: &[
+        "seed.flowee.cash",
+        "seed-bch.bitcoinforks.org",
+        "btccash-seeder.bitcoinunlimited.info",
+        "seed.bchd.cash",
+        "seed.bch.loping.net",
+        "dnsseed.electroncash.de",
+    ],
 };
 
 pub static TESTNET3: Params = Params {
@@ -221,6 +237,8 @@ pub static TESTNET3: Params = Params {
     genesis_header: genesis!("dae5494dffff001d1aa4ae18"),
     pow_limit_bits: 0x1d00ffff,
     uahf_height: 1155875,
+    magnetic_anomaly_height: 1267996,
+    rpa_start_height: 0,
     daa_height: 1188697,
     asert_activation_height: 1421481,
     asert_anchor_height: 1421481,
@@ -231,6 +249,11 @@ pub static TESTNET3: Params = Params {
     no_difficulty_adjustment: false,
     checkpoints: &[],
     cashaddr_prefix: "bchtest",
+    dns_seeds: &[
+        "testnet-seed-bch.bitcoinforks.org",
+        "testnet-seed.bchd.cash",
+        "seed.tbch.loping.net",
+    ],
 };
 
 pub static TESTNET4: Params = Params {
@@ -240,6 +263,8 @@ pub static TESTNET4: Params = Params {
     genesis_header: genesis!("f1a93c5fffff001d01d3cd06"),
     pow_limit_bits: 0x1d00ffff,
     uahf_height: 6,
+    magnetic_anomaly_height: 4000,
+    rpa_start_height: 0,
     daa_height: 3000,
     asert_activation_height: 16844,
     asert_anchor_height: 16844,
@@ -250,6 +275,11 @@ pub static TESTNET4: Params = Params {
     no_difficulty_adjustment: false,
     checkpoints: TESTNET4_CHECKPOINTS,
     cashaddr_prefix: "bchtest",
+    dns_seeds: &[
+        "testnet4-seed-bch.toom.im",
+        "seed.tbch4.loping.net",
+        "testnet4-seed.flowee.cash",
+    ],
 };
 
 pub static CHIPNET: Params = Params {
@@ -259,6 +289,8 @@ pub static CHIPNET: Params = Params {
     genesis_header: genesis!("f1a93c5fffff001d01d3cd06"),
     pow_limit_bits: 0x1d00ffff,
     uahf_height: 6,
+    magnetic_anomaly_height: 4000,
+    rpa_start_height: 0,
     daa_height: 3000,
     asert_activation_height: 16844,
     asert_anchor_height: 16844,
@@ -269,6 +301,7 @@ pub static CHIPNET: Params = Params {
     no_difficulty_adjustment: false,
     checkpoints: TESTNET4_CHECKPOINTS,
     cashaddr_prefix: "bchtest",
+    dns_seeds: &["chipnet.imaginary.cash", "chipnet.bitjson.com"],
 };
 
 pub static REGTEST: Params = Params {
@@ -278,6 +311,8 @@ pub static REGTEST: Params = Params {
     genesis_header: genesis!("dae5494dffff7f2002000000"),
     pow_limit_bits: 0x207fffff,
     uahf_height: 0,
+    magnetic_anomaly_height: 0,
+    rpa_start_height: 0,
     daa_height: 0,
     asert_activation_height: 0,
     asert_anchor_height: 0,
@@ -288,6 +323,7 @@ pub static REGTEST: Params = Params {
     no_difficulty_adjustment: true,
     checkpoints: &[],
     cashaddr_prefix: "bchreg",
+    dns_seeds: &[],
 };
 
 pub static SIMNET: Params = Params {
@@ -297,6 +333,8 @@ pub static SIMNET: Params = Params {
     genesis_header: genesis!("45068653ffff7f2002000000"),
     pow_limit_bits: 0x207fffff,
     uahf_height: 0,
+    magnetic_anomaly_height: 3000,
+    rpa_start_height: 0,
     daa_height: 2000,
     asert_activation_height: 4000,
     asert_anchor_height: 0,
@@ -307,6 +345,7 @@ pub static SIMNET: Params = Params {
     no_difficulty_adjustment: true,
     checkpoints: &[],
     cashaddr_prefix: "bchsim",
+    dns_seeds: &[],
 };
 
 #[cfg(test)]

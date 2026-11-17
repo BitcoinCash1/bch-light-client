@@ -66,6 +66,8 @@ pub mod block;
 pub mod cashaddr;
 pub mod chain;
 mod client;
+pub mod dispute;
+pub mod dsproof;
 pub mod encode;
 mod error;
 pub mod fetch;
@@ -83,11 +85,13 @@ pub mod scan;
 pub mod tx;
 
 pub use client::{
-    Balance, Config, Confirmation, Event, FeeEstimate, History, LightClient, MempoolEntry,
-    MempoolSummary, MerkleProof, OutputInfo, Status, TokenFilter, TxInfo, Utxo,
+    Balance, Config, Confirmation, DsProofInfo, Event, FeeEstimate, History, LightClient,
+    MempoolEntry, MempoolSummary, MerkleProof, OutputInfo, RpaMatch, Stats, Status, TokenFilter,
+    TxInfo, Utxo,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use hash::{BlockHash, Txid};
 pub use history::{ConfirmedTx, Received, Spent, Target};
 pub use params::Network;
+pub use rpa::Prefix;
 pub use tx::{Category, Nft, NftCapability, OutPoint, TokenData, Transaction, TxOut};

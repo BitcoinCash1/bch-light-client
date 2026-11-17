@@ -64,7 +64,10 @@ impl Prefix {
     /// The 16-bit values with this prefix: [start, end).
     pub fn range(&self) -> (u32, u32) {
         let shift = 16 - u32::from(self.bits);
-        (u32::from(self.value) << shift, (u32::from(self.value) + 1) << shift)
+        (
+            u32::from(self.value) << shift,
+            (u32::from(self.value) + 1) << shift,
+        )
     }
 
     pub fn contains(&self, value: u16) -> bool {
@@ -178,7 +181,9 @@ pub fn encode(values: &[u16]) -> Vec<u8> {
 pub fn decode(bytes: &[u8]) -> Result<Vec<u16>, DecodeError> {
     let mut r = Reader::new(bytes);
     let n = r.compact_size().map_err(|e| match e {
-        DecodeError::NonCanonicalSize => DecodeError::Invalid("filter count not in its shortest form"),
+        DecodeError::NonCanonicalSize => {
+            DecodeError::Invalid("filter count not in its shortest form")
+        }
         other => other,
     })?;
     if n > RPA_MAX_VALUES {
@@ -190,7 +195,9 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<u16>, DecodeError> {
     }
     let k = r.u8()?;
     if k > 15 || k != rice_k(n) {
-        return Err(DecodeError::Invalid("Rice parameter is not the one the count gives"));
+        return Err(DecodeError::Invalid(
+            "Rice parameter is not the one the count gives",
+        ));
     }
     let data = r.bytes(r.remaining())?;
     let mut bits = Bits { data, pos: 0 };
@@ -275,8 +282,11 @@ mod tests {
     use serde_json::Value;
 
     fn vectors() -> Value {
-        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/rpa-filter-vectors.json"))
-            .expect("vectors");
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/rpa-filter-vectors.json"
+        ))
+        .expect("vectors");
         serde_json::from_str(&text).expect("json")
     }
 
@@ -286,22 +296,60 @@ mod tests {
         let mut header = [0u8; 32];
         for case in v["blocks"].as_array().unwrap() {
             let name = case["name"].as_str().unwrap();
-            let block = Block::from_bytes(&hex::decode(case["block"].as_str().unwrap()).unwrap()).unwrap();
-            assert_eq!(hex::encode(block.hash().0), case["block_hash"].as_str().unwrap(), "{name}");
-            let values: Vec<String> = block_values(&block).iter().map(|v| format!("{v:04x}")).collect();
-            let expected: Vec<String> =
-                case["values"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+            let block =
+                Block::from_bytes(&hex::decode(case["block"].as_str().unwrap()).unwrap()).unwrap();
+            assert_eq!(
+                hex::encode(block.hash().0),
+                case["block_hash"].as_str().unwrap(),
+                "{name}"
+            );
+            let values: Vec<String> = block_values(&block)
+                .iter()
+                .map(|v| format!("{v:04x}"))
+                .collect();
+            let expected: Vec<String> = case["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
             assert_eq!(values, expected, "{name}");
-            for (tx, inputs) in block.txs.iter().skip(1).zip(case["input_values"].as_array().unwrap()) {
-                let got: Vec<String> = tx.inputs.iter().map(|i| format!("{:04x}", input_value(i))).collect();
-                let want: Vec<&str> = inputs.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            for (tx, inputs) in block
+                .txs
+                .iter()
+                .skip(1)
+                .zip(case["input_values"].as_array().unwrap())
+            {
+                let got: Vec<String> = tx
+                    .inputs
+                    .iter()
+                    .map(|i| format!("{:04x}", input_value(i)))
+                    .collect();
+                let want: Vec<&str> = inputs
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap())
+                    .collect();
                 assert_eq!(got, want, "{name}");
             }
             let filter = build(&block);
-            assert_eq!(hex::encode(&filter), case["filter"].as_str().unwrap(), "{name}");
-            assert_eq!(hex::encode(sha256d(&filter)), case["filter_hash"].as_str().unwrap(), "{name}");
+            assert_eq!(
+                hex::encode(&filter),
+                case["filter"].as_str().unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                hex::encode(sha256d(&filter)),
+                case["filter_hash"].as_str().unwrap(),
+                "{name}"
+            );
             header = next_filter_header(&filter, &header);
-            assert_eq!(hex::encode(header), case["header"].as_str().unwrap(), "{name}");
+            assert_eq!(
+                hex::encode(header),
+                case["header"].as_str().unwrap(),
+                "{name}"
+            );
             if let Some(k) = case["k"].as_u64() {
                 assert_eq!(u64::from(filter[1]), k, "{name}");
             }
@@ -332,8 +380,14 @@ mod tests {
         let filter = encode(&values);
         assert_eq!(filter.len() as u64, large["bytes"].as_u64().unwrap());
         assert_eq!(hex::encode(&filter[..16]), large["head"].as_str().unwrap());
-        assert_eq!(hex::encode(&filter[filter.len() - 8..]), large["tail"].as_str().unwrap());
-        assert_eq!(hex::encode(sha256d(&filter)), large["filter_hash"].as_str().unwrap());
+        assert_eq!(
+            hex::encode(&filter[filter.len() - 8..]),
+            large["tail"].as_str().unwrap()
+        );
+        assert_eq!(
+            hex::encode(sha256d(&filter)),
+            large["filter_hash"].as_str().unwrap()
+        );
         assert_eq!(decode(&filter).unwrap(), values);
     }
 
@@ -349,7 +403,11 @@ mod tests {
         }
         for case in v["malformed"].as_array().unwrap() {
             let bytes = hex::decode(case["hex"].as_str().unwrap()).unwrap();
-            assert!(decode(&bytes).is_err(), "took the malformed case {}", case["name"]);
+            assert!(
+                decode(&bytes).is_err(),
+                "took the malformed case {}",
+                case["name"]
+            );
         }
     }
 
@@ -401,13 +459,23 @@ mod tests {
             (0x0001, 16, false),
         ];
         for (value, bits, want) in cases {
-            assert_eq!(Prefix::new(value, bits).unwrap().matches(&values), want, "{value:x}/{bits}");
+            assert_eq!(
+                Prefix::new(value, bits).unwrap().matches(&values),
+                want,
+                "{value:x}/{bits}"
+            );
         }
         assert!(Prefix::new(0, 0).is_err());
         assert!(Prefix::new(0x12ff, 17).is_err());
         assert!(Prefix::new(0x1ff, 8).is_err());
         assert!(!Prefix::new(0, 4).unwrap().matches(&[]));
-        assert_eq!(Prefix::from_hex("a5").unwrap(), Prefix { value: 0xa5, bits: 8 });
+        assert_eq!(
+            Prefix::from_hex("a5").unwrap(),
+            Prefix {
+                value: 0xa5,
+                bits: 8
+            }
+        );
         assert_eq!(Prefix::from_hex("A5a").unwrap().to_hex(), "a5a");
         assert!(Prefix::from_hex("12345").is_err());
         assert!(Prefix::from_hex("").is_err());

@@ -22,7 +22,7 @@ use crate::p2p::pool::Pool;
 use crate::p2p::socks::{PeerAddr, Transport};
 use crate::params::Network;
 use crate::scan::{scan, ScanKey};
-use crate::tx::{OutPoint, TokenData, Transaction};
+use crate::tx::{OutPoint, TokenData, Transaction, TxOut};
 use rand::Rng;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -32,6 +32,14 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+
+mod dsproofs;
+mod filters;
+mod persist;
+mod rpa_search;
+pub use dsproofs::DsProofInfo;
+use filters::{store_base, FilterKind};
+pub use rpa_search::RpaMatch;
 
 /// How the client reaches the network and how much it downloads.
 #[derive(Debug, Clone)]
@@ -62,6 +70,21 @@ pub struct Config {
     pub request_timeout: Duration,
     pub block_cache_bytes: usize,
     pub mempool_max_bytes: usize,
+    /// The wallet's birthday: filters are kept, and histories read, from the
+    /// filter checkpoint at or below this height (0: from genesis).
+    pub filters_from_height: u32,
+    /// Keep input prefix filters (type 2) for reusable payment addresses.
+    pub rpa_filters: bool,
+    /// Where input prefix filters start; by default the network's usual RPA
+    /// start height, or the birthday when that is later.
+    pub rpa_from_height: Option<u32>,
+    /// Random other prefixes whose blocks an RPA search also downloads, so
+    /// a peer that sees the downloads cannot tell which prefix is the wallet's.
+    pub rpa_cover_prefixes: usize,
+    /// Look up peers from the network's DNS seeds (not through a proxy).
+    pub dns_seeds: bool,
+    /// Learn peers from the addresses connected peers announce.
+    pub learn_peers: bool,
 }
 
 impl Config {
@@ -81,6 +104,12 @@ impl Config {
             request_timeout: Duration::from_secs(60),
             block_cache_bytes: 64 << 20,
             mempool_max_bytes: 256 << 20,
+            filters_from_height: 0,
+            rpa_filters: false,
+            rpa_from_height: None,
+            rpa_cover_prefixes: 0,
+            dns_seeds: false,
+            learn_peers: true,
         }
     }
 }
@@ -102,6 +131,8 @@ pub enum Event {
     MempoolTx { txid: Txid },
     /// A watched target's history, confirmed or unconfirmed, changed.
     TargetChanged { target: Target },
+    /// A checked double-spend proof concerns this mempool transaction.
+    DoubleSpendProof { txid: Txid, id: [u8; 32] },
 }
 
 /// Where the client stands.
@@ -115,6 +146,17 @@ pub struct Status {
     pub synced: bool,
     /// Whether the peers' filters hold transaction keys, once a block has shown it.
     pub txid_keys: Option<bool>,
+    /// The highest height with an input prefix filter, when they are kept.
+    pub rpa_height: Option<u32>,
+}
+
+/// What the client has downloaded since it started, in bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub headers: u64,
+    pub filters: u64,
+    pub blocks: u64,
+    pub blocks_downloaded: u64,
 }
 
 /// A target's transaction in the mempool.
@@ -251,11 +293,19 @@ struct SyncState {
     synced: bool,
     header_tip: u32,
     filter_tip: Option<u32>,
+    rpa_tip: Option<u32>,
+}
+
+/// What the client has downloaded.
+#[derive(Default)]
+struct Counters {
+    header_bytes: AtomicU64,
+    filter_bytes: AtomicU64,
 }
 
 #[derive(Default)]
 struct Recent {
-    outputs: HashMap<OutPoint, u64>,
+    outputs: HashMap<OutPoint, TxOut>,
     blocks: VecDeque<Vec<OutPoint>>,
     fee_rates: VecDeque<u64>,
 }
@@ -266,6 +316,11 @@ struct Inner {
     fetcher: BlockFetcher,
     chain: RwLock<HeaderChain>,
     filters: RwLock<FilterStore>,
+    rpa_filters: Option<RwLock<FilterStore>>,
+    stats: Counters,
+    dsproofs: Mutex<dsproofs::DsProofs>,
+    /// The network's data folder.
+    dir: PathBuf,
     generation: AtomicU64,
     targets: Mutex<HashMap<FilterKey, TargetState>>,
     mempool: RwLock<Mempool>,
@@ -298,8 +353,11 @@ impl LightClient {
     /// Opens the stores and starts connecting and syncing in the background.
     pub async fn start(config: Config) -> Result<LightClient> {
         let params = config.network.params();
-        if config.peers.is_empty() {
-            return Err(Error::new(ErrorKind::InvalidInput, "no peers given"));
+        if config.peers.is_empty() && !config.dns_seeds {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "no peers given and no DNS seeds allowed",
+            ));
         }
         let peers = config
             .peers
@@ -319,8 +377,20 @@ impl LightClient {
         std::fs::create_dir_all(&dir).map_err(|e| storage_error("data folder", e))?;
         let chain = HeaderChain::open(&dir.join("headers.dat"), params)
             .map_err(|e| storage_error("headers", e))?;
-        let filters = FilterStore::open(&dir, |h| chain.hash_at(h))
+        let birthday = config.filters_from_height;
+        let filters = FilterStore::open(&dir, "", store_base(birthday), |h| chain.hash_at(h))
             .map_err(|e| storage_error("filters", e))?;
+        let rpa_filters = if config.rpa_filters {
+            let from = config
+                .rpa_from_height
+                .unwrap_or(params.rpa_start_height.max(birthday));
+            Some(RwLock::new(
+                FilterStore::open(&dir, "rpa-", store_base(from), |h| chain.hash_at(h))
+                    .map_err(|e| storage_error("input prefix filters", e))?,
+            ))
+        } else {
+            None
+        };
         info!(
             network = params.name,
             headers = chain.tip_height(),
@@ -338,7 +408,15 @@ impl LightClient {
             transport,
             connect_timeout: config.request_timeout.min(Duration::from_secs(30)),
         };
-        let (pool, peer_events) = Pool::new(peers, options, config.service_peers);
+        let (pool, peer_events) =
+            Pool::new(peers, options, config.service_peers, config.learn_peers);
+        // DNS lookups would go around a proxy, so they are skipped behind one.
+        if config.dns_seeds && config.proxy.is_none() {
+            let seeding = pool.clone();
+            tokio::spawn(async move {
+                seeding.seed(params.dns_seeds, params.default_port).await;
+            });
+        }
         let fetcher = BlockFetcher::new(
             pool.clone(),
             isolate,
@@ -348,15 +426,23 @@ impl LightClient {
         );
         let (shutdown, _) = watch::channel(false);
         let (events, _) = broadcast::channel(4096);
+        let watched = persist::load(&dir, &chain);
         let filter_tip = filters.tip();
+        let rpa_tip = rpa_filters
+            .as_ref()
+            .and_then(|s| s.read().expect("filters lock").tip());
         let header_tip = chain.tip_height();
         let inner = Arc::new(Inner {
             pool,
             fetcher,
             chain: RwLock::new(chain),
             filters: RwLock::new(filters),
+            rpa_filters,
+            stats: Counters::default(),
+            dsproofs: Mutex::new(dsproofs::DsProofs::default()),
+            dir: dir.clone(),
             generation: AtomicU64::new(0),
-            targets: Mutex::new(HashMap::new()),
+            targets: Mutex::new(watched),
             mempool: RwLock::new(Mempool::new(config.mempool_max_bytes)),
             recent: Mutex::new(Recent::default()),
             peer_fees: Mutex::new(HashMap::new()),
@@ -365,6 +451,7 @@ impl LightClient {
                 synced: false,
                 header_tip,
                 filter_tip,
+                rpa_tip,
             })
             .0,
             wake: Notify::new(),
@@ -404,6 +491,18 @@ impl LightClient {
             peers: self.inner.pool.peers().len(),
             synced: state.synced,
             txid_keys: *self.inner.txid_keys.lock().expect("lock"),
+            rpa_height: state.rpa_tip,
+        }
+    }
+
+    /// Bytes downloaded since the client started.
+    pub fn stats(&self) -> Stats {
+        let (blocks, blocks_downloaded) = self.inner.fetcher.downloaded();
+        Stats {
+            headers: self.inner.stats.header_bytes.load(Ordering::Relaxed),
+            filters: self.inner.stats.filter_bytes.load(Ordering::Relaxed),
+            blocks,
+            blocks_downloaded,
         }
     }
 
@@ -489,12 +588,17 @@ impl LightClient {
 
     /// Stops watching; returns whether the target was watched.
     pub fn unwatch(&self, target: &Target) -> bool {
-        self.inner
+        let removed = self
+            .inner
             .targets
             .lock()
             .expect("targets lock")
             .remove(&target.key())
-            .is_some()
+            .is_some();
+        if removed {
+            persist::save(&self.inner);
+        }
+        removed
     }
 
     /// The watched targets.
@@ -966,7 +1070,8 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
                 if items.iter().any(|i| i.kind == INV_BLOCK) {
                     inner.wake.notify_one();
                 }
-                let wanted: Vec<Inv> = {
+                let mut wanted: Vec<Inv> = dsproofs::wanted(&inner, &items);
+                wanted.extend({
                     let mempool = inner.mempool.read().expect("mempool lock");
                     let mut requested = inner.requested.lock().expect("requested lock");
                     if requested.len() > 100_000 {
@@ -979,8 +1084,8 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
                             !mempool.contains(&Txid(i.hash)) && requested.insert(Txid(i.hash))
                         })
                         .copied()
-                        .collect()
-                };
+                        .collect::<Vec<Inv>>()
+                });
                 // Every announced transaction is fetched: what is asked for says nothing.
                 if !wanted.is_empty() {
                     if let Some(p) = inner.pool.peers().into_iter().find(|p| p.id == peer) {
@@ -989,6 +1094,18 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
                 }
             }
             "headers" => inner.wake.notify_one(),
+            crate::dsproof::COMMAND => dsproofs::on_proof(&inner, message.payload),
+            "addr" if inner.config.learn_peers => {
+                if let Ok(addrs) = crate::p2p::pool::decode_addr(&message.payload) {
+                    let learned = inner.pool.learn(
+                        addrs.into_iter().map(|(a, s)| (a, Some(s))),
+                        crate::p2p::pool::Source::Gossip,
+                    );
+                    if learned > 0 {
+                        debug!(learned, "addresses from a peer");
+                    }
+                }
+            }
             "tx" => {
                 if let Ok(tx) = Transaction::from_bytes(&message.payload) {
                     inner
@@ -1014,14 +1131,14 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
 }
 
 /// Adds a relayed transaction to the mempool copy and tells which watched targets it touches.
-fn on_mempool_tx(inner: &Inner, tx: Transaction) {
+fn on_mempool_tx(inner: &Arc<Inner>, tx: Transaction) {
     let txid = tx.txid();
     let touched: Vec<Target> = {
         let states = inner.targets.lock().expect("targets lock");
         let recent = inner.recent.lock().expect("recent lock");
         let mut mempool = inner.mempool.write().expect("mempool lock");
         let known = |o: &OutPoint| {
-            recent.outputs.get(o).copied().or_else(|| {
+            recent.outputs.get(o).map(|o| o.value).or_else(|| {
                 states
                     .values()
                     .find_map(|s| s.coins.get(o).map(|c| c.value))
@@ -1059,6 +1176,9 @@ fn on_mempool_tx(inner: &Inner, tx: Transaction) {
     for target in touched {
         inner.emit(Event::TargetChanged { target });
     }
+    if dsproofs::has_pending(inner) {
+        dsproofs::retry_pending(inner);
+    }
 }
 
 async fn sync_loop(inner: Arc<Inner>) {
@@ -1087,7 +1207,10 @@ async fn sync_once(inner: &Arc<Inner>) -> Result<()> {
         .await
         .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no peer connected"))?;
     sync_headers(inner, &peer).await?;
-    sync_filters(inner).await?;
+    filters::sync(inner, FilterKind::Script).await?;
+    if let Err(e) = filters::sync(inner, FilterKind::Rpa).await {
+        warn!(error = %e, "input prefix filters not synced");
+    }
     follow_tip(inner).await?;
     let (header_tip, filter_tip) = {
         let chain = inner.chain.read().expect("chain lock");
@@ -1149,6 +1272,10 @@ async fn sync_headers(inner: &Arc<Inner>, peer: &Peer) -> Result<()> {
                 },
             )
             .await?;
+        inner
+            .stats
+            .header_bytes
+            .fetch_add(reply[0].payload.len() as u64, Ordering::Relaxed);
         let headers = decode_headers(&reply[0].payload)
             .map_err(|e| Error::with_source(ErrorKind::InvalidData, "headers message", e))?;
         let full = headers.len() == MAX_HEADERS_PER_MSG;
@@ -1191,12 +1318,38 @@ async fn sync_headers(inner: &Arc<Inner>, peer: &Peer) -> Result<()> {
 
 fn on_reorg(inner: &Arc<Inner>, fork: u32) -> Result<()> {
     warn!(fork, "chain reorganization");
-    inner
-        .filters
-        .write()
-        .expect("filters lock")
-        .truncate(fork + 1)
-        .map_err(|e| storage_error("filters", e))?;
+    // The blocks that leave the chain, while the filter store still names them.
+    let disconnected: Vec<Arc<Block>> = {
+        let store = inner.filters.read().expect("filters lock");
+        (fork + 1..store.next_height())
+            .filter_map(|h| store.block_hash(h))
+            .filter_map(|hash| inner.fetcher.cached(&hash))
+            .collect()
+    };
+    for kind in [FilterKind::Script, FilterKind::Rpa] {
+        if let Some(store) = inner.store(kind) {
+            store
+                .write()
+                .expect("filters lock")
+                .truncate_from(fork + 1)
+                .map_err(|e| storage_error("filters", e))?;
+        }
+    }
+    // Their transactions go back to the mempool copy, as nodes put them
+    // back in theirs, except those that spend a disconnected coinbase.
+    let mut gone: HashSet<Txid> = disconnected
+        .iter()
+        .filter_map(|b| b.txs.first().map(|t| t.txid()))
+        .collect();
+    for block in &disconnected {
+        for tx in block.txs.iter().skip(1) {
+            if tx.inputs.iter().any(|i| gone.contains(&i.prevout.txid)) {
+                gone.insert(tx.txid());
+                continue;
+            }
+            on_mempool_tx(inner, tx.clone());
+        }
+    }
     let changed: Vec<Target> = {
         let mut states = inner.targets.lock().expect("targets lock");
         states
@@ -1210,252 +1363,14 @@ fn on_reorg(inner: &Arc<Inner>, fork: u32) -> Result<()> {
     }
     inner.state.send_modify(|s| {
         s.filter_tip = s.filter_tip.map(|t| t.min(fork));
+        s.rpa_tip = s.rpa_tip.map(|t| t.min(fork));
         s.synced = false;
     });
     inner.emit(Event::Reorg { fork_height: fork });
     for target in changed {
         inner.emit(Event::TargetChanged { target });
     }
-    Ok(())
-}
-
-struct FilterBatch {
-    start: u32,
-    hashes: Vec<BlockHash>,
-    prev_header: [u8; 32],
-    filter_hashes: Vec<[u8; 32]>,
-    filters: Vec<Vec<u8>>,
-}
-
-async fn fetch_filter_batch(
-    peer: Arc<Peer>,
-    start: u32,
-    hashes: Vec<BlockHash>,
-    timeout: Duration,
-) -> Result<FilterBatch> {
-    let stop = *hashes.last().expect("non-empty batch");
-    let reply = peer
-        .request(
-            "getcfheaders",
-            encode_getcf(SCRIPT_FILTER_TYPE, start, stop),
-            timeout,
-            move |m| match decode_cfheaders(&m.payload) {
-                Ok(h)
-                    if m.command == "cfheaders"
-                        && h.filter_type == SCRIPT_FILTER_TYPE
-                        && h.stop == stop =>
-                {
-                    Step::Done
-                }
-                _ => Step::Skip,
-            },
-        )
-        .await?;
-    let cfheaders = decode_cfheaders(&reply[0].payload)
-        .map_err(|e| Error::with_source(ErrorKind::InvalidData, "cfheaders", e))?;
-    if cfheaders.filter_hashes.len() != hashes.len() {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("cfheaders from {start} has the wrong count"),
-        ));
-    }
-    let mut filters: Vec<Vec<u8>> = Vec::with_capacity(hashes.len());
-    for (i, chunk) in hashes.chunks(MAX_CFILTERS_PER_MSG).enumerate() {
-        let chunk_start = start + (i * MAX_CFILTERS_PER_MSG) as u32;
-        let wanted: HashSet<BlockHash> = chunk.iter().copied().collect();
-        let mut remaining = chunk.len();
-        let reply = peer
-            .request(
-                "getcfilters",
-                encode_getcf(
-                    SCRIPT_FILTER_TYPE,
-                    chunk_start,
-                    *chunk.last().expect("non-empty"),
-                ),
-                timeout,
-                move |m| {
-                    if m.command != "cfilter" {
-                        return Step::Skip;
-                    }
-                    match decode_cfilter(&m.payload) {
-                        Ok(f)
-                            if f.filter_type == SCRIPT_FILTER_TYPE && wanted.contains(&f.block) =>
-                        {
-                            remaining -= 1;
-                            if remaining == 0 {
-                                Step::Done
-                            } else {
-                                Step::More
-                            }
-                        }
-                        _ => Step::Skip,
-                    }
-                },
-            )
-            .await?;
-        for (j, message) in reply.iter().enumerate() {
-            let f = decode_cfilter(&message.payload)
-                .map_err(|e| Error::with_source(ErrorKind::InvalidData, "cfilter", e))?;
-            let index = i * MAX_CFILTERS_PER_MSG + j;
-            if f.block != hashes[index] || sha256d(&f.filter) != cfheaders.filter_hashes[index] {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!(
-                        "filter of block {} does not match its filter header",
-                        f.block
-                    ),
-                ));
-            }
-            filters.push(f.filter);
-        }
-    }
-    Ok(FilterBatch {
-        start,
-        hashes,
-        prev_header: cfheaders.prev_header,
-        filter_hashes: cfheaders.filter_hashes,
-        filters,
-    })
-}
-
-async fn checkpoints(inner: &Arc<Inner>, stop: BlockHash) -> Result<Vec<[u8; 32]>> {
-    let mut agreed: Option<Vec<[u8; 32]>> = None;
-    for peer in inner.pool.peers() {
-        let reply = peer
-            .request(
-                "getcfcheckpt",
-                encode_getcfcheckpt(SCRIPT_FILTER_TYPE, stop),
-                inner.config.request_timeout,
-                move |m| match decode_cfcheckpt(&m.payload) {
-                    Ok(c)
-                        if m.command == "cfcheckpt"
-                            && c.filter_type == SCRIPT_FILTER_TYPE
-                            && c.stop == stop =>
-                    {
-                        Step::Done
-                    }
-                    _ => Step::Skip,
-                },
-            )
-            .await;
-        let Ok(reply) = reply else { continue };
-        let Ok(list) = decode_cfcheckpt(&reply[0].payload) else {
-            continue;
-        };
-        match &agreed {
-            None => agreed = Some(list.headers),
-            Some(previous) => {
-                let common = previous.len().min(list.headers.len());
-                if previous[..common] != list.headers[..common] {
-                    return Err(Error::new(
-                        ErrorKind::InvalidData,
-                        "peers disagree on the filter header checkpoints",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(agreed.unwrap_or_default())
-}
-
-async fn sync_filters(inner: &Arc<Inner>) -> Result<()> {
-    let (tip, tip_hash) = {
-        let chain = inner.chain.read().expect("chain lock");
-        (chain.tip_height(), chain.tip_hash())
-    };
-    let first = inner.filters.read().expect("filters lock").len() as u32;
-    if first > tip {
-        return Ok(());
-    }
-    let generation = inner.generation.load(Ordering::SeqCst);
-    let checkpoints = if tip / CHECKPOINT_INTERVAL > first / CHECKPOINT_INTERVAL || first == 0 {
-        checkpoints(inner, tip_hash).await?
-    } else {
-        Vec::new()
-    };
-    let timeout = inner.config.request_timeout;
-    let mut pending: VecDeque<JoinHandle<Result<FilterBatch>>> = VecDeque::new();
-    let mut next = first;
-    let in_flight = inner.pool.peers().len().max(1) * 2;
-    let started = std::time::Instant::now();
-    loop {
-        while pending.len() < in_flight && next <= tip {
-            let end = (next + MAX_CFHEADERS_PER_MSG as u32 - 1).min(tip);
-            let hashes: Vec<BlockHash> = {
-                let chain = inner.chain.read().expect("chain lock");
-                (next..=end)
-                    .map(|h| chain.hash_at(h).expect("below tip"))
-                    .collect()
-            };
-            let peer = inner
-                .pool
-                .next_peer()
-                .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no peer connected"))?;
-            pending.push_back(tokio::spawn(fetch_filter_batch(
-                peer, next, hashes, timeout,
-            )));
-            next = end + 1;
-        }
-        let Some(task) = pending.pop_front() else {
-            break;
-        };
-        let batch = task
-            .await
-            .map_err(|e| Error::new(ErrorKind::Stopped, e.to_string()))??;
-        if inner.generation.load(Ordering::SeqCst) != generation {
-            return Ok(());
-        }
-        let mut store = inner.filters.write().expect("filters lock");
-        if store.len() as u32 != batch.start {
-            return Ok(());
-        }
-        let prev = store
-            .tip()
-            .and_then(|t| store.filter_header(t))
-            .unwrap_or([0u8; 32]);
-        if batch.prev_header != prev {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("filter headers from {} do not chain to ours", batch.start),
-            ));
-        }
-        let chain = inner.chain.read().expect("chain lock");
-        let mut header = prev;
-        let mut items = Vec::with_capacity(batch.filters.len());
-        for (i, filter) in batch.filters.into_iter().enumerate() {
-            let height = batch.start + i as u32;
-            if chain.hash_at(height) != Some(batch.hashes[i]) {
-                return Ok(());
-            }
-            header = filter_header_from_hash(&batch.filter_hashes[i], &header);
-            if height % CHECKPOINT_INTERVAL == 0 && height > 0 {
-                if let Some(cp) = checkpoints.get((height / CHECKPOINT_INTERVAL - 1) as usize) {
-                    if *cp != header {
-                        return Err(Error::new(
-                            ErrorKind::InvalidData,
-                            format!("filter header at {height} differs from the checkpoint"),
-                        ));
-                    }
-                }
-            }
-            items.push((batch.hashes[i], header, filter));
-        }
-        store
-            .append(&items)
-            .map_err(|e| storage_error("filters", e))?;
-        let tip_now = store.tip();
-        drop(chain);
-        drop(store);
-        inner.state.send_modify(|s| s.filter_tip = tip_now);
-    }
-    if next > first + 1 {
-        info!(
-            from = first,
-            to = tip,
-            seconds = started.elapsed().as_secs_f64(),
-            "filters synced"
-        );
-    }
+    persist::save(inner);
     Ok(())
 }
 
@@ -1495,7 +1410,7 @@ async fn follow_tip(inner: &Arc<Inner>) -> Result<()> {
             for tx in &block.txs {
                 for (vout, output) in tx.outputs.iter().enumerate() {
                     let outpoint = OutPoint::new(tx.txid(), vout as u32);
-                    recent.outputs.insert(outpoint, output.value);
+                    recent.outputs.insert(outpoint, output.clone());
                     created.push(outpoint);
                 }
             }
@@ -1503,7 +1418,7 @@ async fn follow_tip(inner: &Arc<Inner>) -> Result<()> {
                 let inputs: Option<u64> = tx
                     .inputs
                     .iter()
-                    .map(|i| recent.outputs.get(&i.prevout).copied())
+                    .map(|i| recent.outputs.get(&i.prevout).map(|o| o.value))
                     .sum();
                 let outputs: u64 = tx.outputs.iter().map(|o| o.value).sum();
                 if let Some(fee) = inputs.and_then(|i| i.checked_sub(outputs)) {
@@ -1524,6 +1439,7 @@ async fn follow_tip(inner: &Arc<Inner>) -> Result<()> {
                 }
             }
         }
+        dsproofs::on_block(inner, &block);
         *inner.live_tip.lock().expect("live lock") = Some(height);
         if !removed.is_empty() {
             debug!(
@@ -1566,6 +1482,7 @@ async fn block_at(inner: &Arc<Inner>, height: u32) -> Result<Arc<Block>> {
             let check = check_block(&block, &filter).map_err(|e| {
                 Error::with_source(ErrorKind::InvalidData, format!("block {height}"), e)
             })?;
+            check_rpa_filter(inner, height, &block)?;
             let mut known = inner.txid_keys.lock().expect("lock");
             if *known != Some(check.has_txid_keys) {
                 info!(
@@ -1577,6 +1494,38 @@ async fn block_at(inner: &Arc<Inner>, height: u32) -> Result<Arc<Block>> {
         }
     }
     Ok(block)
+}
+
+/// A block against its stored input prefix filter, rebuilt from the block.
+/// A filter that does not match was served wrong: it goes, and is fetched
+/// again from the peers.
+fn check_rpa_filter(inner: &Arc<Inner>, height: u32, block: &Block) -> Result<()> {
+    let Some(store) = inner.store(FilterKind::Rpa) else {
+        return Ok(());
+    };
+    let stored = {
+        let store = store.read().expect("filters lock");
+        if store.block_hash(height) != Some(block.hash()) {
+            return Ok(());
+        }
+        store.read_checked(height).ok()
+    };
+    let Some(stored) = stored else { return Ok(()) };
+    if crate::rpa::build(block) != stored {
+        store
+            .write()
+            .expect("filters lock")
+            .truncate_from(height)
+            .map_err(|e| storage_error("filters", e))?;
+        inner
+            .state
+            .send_modify(|s| s.rpa_tip = height.checked_sub(1));
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("the input prefix filter of block {height} does not match the block"),
+        ));
+    }
+    Ok(())
 }
 
 /// Heights from `from` on whose filters match `key`.
@@ -1783,6 +1732,7 @@ async fn catch_up(inner: &Arc<Inner>) -> Result<()> {
                 .filter_map(|k| states.get(k).map(|s| s.target.clone()))
                 .collect()
         };
+        persist::save(inner);
         for target in changed {
             inner.emit(Event::TargetChanged { target });
         }
