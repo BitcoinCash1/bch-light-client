@@ -2,3 +2,7 @@
 /target-*
 /.tools
 /tmp
+/target-188/
+/target-clippy/
+/target/
+/target*/
