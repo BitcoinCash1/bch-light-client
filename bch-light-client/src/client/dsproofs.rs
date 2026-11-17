@@ -195,20 +195,54 @@ pub(crate) fn retry_pending(inner: &Arc<Inner>) {
     }
 }
 
-/// Drops the proofs of outputs a block spends: the double spend is settled.
+/// Drops the proofs of outputs a block spends: the double spend is settled,
+/// and the transactions they concerned are announced, as Fulcrum tells
+/// their subscribers that the proof went.
 pub(crate) fn on_block(inner: &Inner, block: &Block) {
     let spent: HashSet<OutPoint> = block
         .txs
         .iter()
         .flat_map(|t| t.inputs.iter().map(|i| i.prevout))
         .collect();
-    let mut proofs = inner.dsproofs.lock().expect("dsproof lock");
-    proofs
-        .valid
-        .retain(|_, s| !spent.contains(&s.proof.outpoint));
-    proofs
-        .pending
-        .retain(|_, (p, _)| !spent.contains(&p.outpoint));
+    let settled: Vec<([u8; 32], Txid)> = {
+        let mut proofs = inner.dsproofs.lock().expect("dsproof lock");
+        let gone: Vec<[u8; 32]> = proofs
+            .valid
+            .iter()
+            .filter(|(_, s)| spent.contains(&s.proof.outpoint))
+            .map(|(id, _)| *id)
+            .collect();
+        proofs
+            .pending
+            .retain(|_, (p, _)| !spent.contains(&p.outpoint));
+        gone.into_iter()
+            .filter_map(|id| proofs.valid.remove(&id).map(|s| (id, s.txid)))
+            .collect()
+    };
+    for (id, txid) in settled {
+        inner.emit(Event::DoubleSpendProof { txid, id });
+    }
+}
+
+/// Announces a new mempool transaction that spends what a proved one
+/// created: the proof concerns it too, as Fulcrum tells its subscribers.
+pub(crate) fn on_descendant(inner: &Inner, tx: &Transaction) {
+    let txid = tx.txid();
+    let found = {
+        let proofs = inner.dsproofs.lock().expect("dsproof lock");
+        if proofs.valid.is_empty() {
+            return;
+        }
+        let mempool = inner.mempool.read().expect("mempool lock");
+        proofs
+            .valid
+            .iter()
+            .find(|(_, s)| s.txid != txid && descendants(&mempool, s.txid).contains(&txid))
+            .map(|(id, _)| *id)
+    };
+    if let Some(id) = found {
+        inner.emit(Event::DoubleSpendProof { txid, id });
+    }
 }
 
 fn descendants(mempool: &Mempool, txid: Txid) -> Vec<Txid> {

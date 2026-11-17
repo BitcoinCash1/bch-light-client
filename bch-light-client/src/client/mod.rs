@@ -132,7 +132,10 @@ pub enum Event {
     MempoolTx { txid: Txid },
     /// A watched target's history, confirmed or unconfirmed, changed.
     TargetChanged { target: Target },
-    /// A checked double-spend proof concerns this mempool transaction.
+    /// The double-spend proof `id` concerns this mempool transaction: it
+    /// arrived and was checked, the transaction joined the descendants of
+    /// the one it proves, or a block settled the double spend and the
+    /// proof went.
     DoubleSpendProof { txid: Txid, id: [u8; 32] },
 }
 
@@ -1270,6 +1273,7 @@ fn on_mempool_tx(inner: &Arc<Inner>, tx: Transaction) {
     for target in touched {
         inner.emit(Event::TargetChanged { target });
     }
+    dsproofs::on_descendant(inner, &tx);
     if dsproofs::has_pending(inner) {
         dsproofs::retry_pending(inner);
     }

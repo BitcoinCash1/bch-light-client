@@ -711,6 +711,60 @@ async fn rpa_and_dsproof_methods() {
             .await,
         json!([first_id])
     );
+    // A child of the proved transaction: the proof concerns it too, and its
+    // subscriber hears so when it reaches the mempool, as from Fulcrum.
+    let child = TxSpec {
+        inputs: vec![(
+            OutPoint::new(txid_of(&first), 0),
+            Unlock::Redeem(vec![0x51]),
+        )],
+        outputs: vec![(499_980_000, mining.clone(), vec![])],
+    }
+    .build();
+    let child_id = txid_of(&child).to_hex();
+    assert_eq!(
+        w.call(
+            "blockchain.transaction.dsproof.subscribe",
+            json!([child_id])
+        )
+        .await,
+        Value::Null
+    );
+    node.send(&child).await;
+    let note = loop {
+        let note = w
+            .notification("blockchain.transaction.dsproof.subscribe")
+            .await;
+        if note["params"][0] == json!(child_id) {
+            break note;
+        }
+    };
+    assert_eq!(note["params"][1]["dspid"], proof["dspid"]);
+    assert_eq!(
+        note["params"][1]["descendants"],
+        json!([first_id, child_id])
+    );
+    // A block settles the double spend: both subscribers hear the proof went.
+    w.notifications.clear();
+    node.generate(1).await;
+    let mut gone = std::collections::BTreeSet::new();
+    while gone.len() < 2 {
+        let note = w
+            .notification("blockchain.transaction.dsproof.subscribe")
+            .await;
+        if note["params"][1].is_null() {
+            gone.insert(note["params"][0].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(
+        gone,
+        [first_id.clone(), child_id.clone()].into_iter().collect()
+    );
+    assert_eq!(
+        w.call("blockchain.transaction.dsproof.list", json!([]))
+            .await,
+        json!([])
+    );
     let stats = w.call("light_client.stats", json!([])).await;
     assert!(stats["block_bytes"].as_u64().unwrap() > 0);
     let passthrough = w.reply("daemon.passthrough", json!([])).await;
