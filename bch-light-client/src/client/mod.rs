@@ -633,9 +633,9 @@ impl LightClient {
         }
     }
 
-    /// A target's confirmed and unconfirmed history. A mempool transaction
-    /// whose fee is unknown gets it from the transactions it spends, looked
-    /// up by ID (see [`LightClient::mempool_fee`]).
+    /// A target's confirmed and unconfirmed history. A mempool transaction's
+    /// fee is there when the client holds the value of every output it
+    /// spends (see [`LightClient::mempool_fee`]), and left out otherwise.
     pub async fn history(&self, target: &Target) -> Result<History> {
         self.ready(target).await?;
         let mut history = {
@@ -651,18 +651,18 @@ impl LightClient {
             }
         };
         for entry in history.mempool.iter_mut().filter(|e| e.fee.is_none()) {
-            entry.fee = self.mempool_fee(entry.txid).await;
+            entry.fee = self.mempool_fee(entry.txid);
         }
         Ok(history)
     }
 
-    /// The fee of a mempool transaction. When the copy does not know the
-    /// value of an output it spends (one older than the last blocks, of no
-    /// watched script), the spent transaction is looked up by ID, which may
-    /// download its block; the fee found is kept. None when a spent
-    /// transaction cannot be found, as without transaction keys in the
-    /// filters.
-    pub async fn mempool_fee(&self, txid: Txid) -> Option<u64> {
+    /// The fee of a mempool transaction, from what the client holds: the
+    /// value of each output it spends must be that of another mempool
+    /// transaction, of the last blocks, or of a watched coin. Nothing is
+    /// downloaded to learn it: fetching the block of an input would show a
+    /// peer which payment the wallet looks at. None when a value is not
+    /// held; a fee found is kept.
+    pub fn mempool_fee(&self, txid: Txid) -> Option<u64> {
         let entry = self
             .inner
             .mempool
@@ -674,14 +674,7 @@ impl LightClient {
         }
         let mut inputs = 0u64;
         for input in &entry.tx.inputs {
-            let value = match known_value(&self.inner, &input.prevout) {
-                Some(value) => value,
-                None => {
-                    let parent = self.transaction(input.prevout.txid, None).await.ok()?;
-                    parent.tx.outputs.get(input.prevout.vout as usize)?.value
-                }
-            };
-            inputs = inputs.checked_add(value)?;
+            inputs = inputs.checked_add(known_value(&self.inner, &input.prevout)?)?;
         }
         let fee = inputs.checked_sub(entry.tx.outputs.iter().map(|o| o.value).sum())?;
         self.inner

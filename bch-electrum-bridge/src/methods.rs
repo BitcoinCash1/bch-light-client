@@ -684,7 +684,9 @@ pub async fn call(session: &Arc<Session>, method: &str, params: &[Value]) -> Res
                 });
                 let fee = match m.fee {
                     Some(fee) => Some(fee),
-                    None => client.mempool_fee(txid).await,
+                    // From what the client holds only: fetching the
+                    // payer's coins would show which payment is the wallet's.
+                    None => client.mempool_fee(txid),
                 };
                 if let Some(fee) = fee {
                     row["fee"] = json!(fee);

@@ -365,15 +365,15 @@ async fn histories_scenario(bin: &std::path::Path, name: &str, txid_keys: bool) 
         .expect("child in mempool history");
     assert!(child.unconfirmed_parent);
     assert_eq!(child.fee, Some(FEE));
-    // The unwatched coin's value comes from its transaction, looked up by
-    // ID when the filters hold transaction keys; without them the fee stays
-    // unknown.
+    // The unwatched coin's value is not held, and its block is never
+    // fetched to learn it (that would show the peer the payment): the fee
+    // stays unknown, with transaction keys in the filters or without.
     let from_unwatched = history
         .mempool
         .iter()
         .find(|e| e.txid == txid_of(&m3))
         .expect("payment from the unwatched coin");
-    assert_eq!(from_unwatched.fee, txid_keys.then_some(FEE));
+    assert_eq!(from_unwatched.fee, None);
     node.generate(1).await;
     compare(&node, &pooled, &targets, "mempool confirmed").await;
     let new_tip = node.height().await;

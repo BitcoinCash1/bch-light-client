@@ -47,6 +47,33 @@ pub fn bchd_txid_binary() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
+/// A binary a test needs: found, or the test is skipped with a note. In CI
+/// (the CI variable is set) a missing binary fails the test instead.
+fn required(found: Option<PathBuf>, what: &str) -> Option<PathBuf> {
+    if found.is_some() {
+        return found;
+    }
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "{what} is missing, and CI must run this test"
+    );
+    eprintln!("skipped: no {what}");
+    None
+}
+
+/// bchd for a test, or None (skipped) outside CI.
+pub fn bchd_or_skip() -> Option<PathBuf> {
+    required(bchd_binary(), "bchd binary (set BCHD_BIN)")
+}
+
+/// A bchd whose filters hold transaction keys, or None (skipped) outside CI.
+pub fn bchd_txid_binary_or_skip() -> Option<PathBuf> {
+    required(
+        bchd_txid_binary(),
+        "bchd with transaction keys in its filters (set BCHD_TXID_BIN)",
+    )
+}
+
 /// A port the OS gives out now; bchd binds it right after.
 pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")

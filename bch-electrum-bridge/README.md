@@ -43,6 +43,13 @@ transaction keys; until the nodes serve them, such lookups work for
 transactions in the mempool and in histories the wallet asked for.
 `daemon.passthrough` is not available: there is no node RPC behind the bridge.
 
+Mempool rows of `blockchain.scripthash.*` and `blockchain.rpa.get_mempool`
+carry a `fee` only when the bridge holds the value of every output the
+transaction spends (outputs of other mempool transactions, of the last 24
+blocks, or of the scripts wallets asked for). It never downloads a block to
+learn a fee: that would show a peer which payment the wallet looks at.
+Fulcrum, which has the whole UTXO set, always gives the fee.
+
 `mempool.get_fee_histogram` reads the bridge's copy of the mempool, which
 holds what peers relay. A transaction counts only when the value of every
 input it spends is known: outputs of other mempool transactions, of the last
