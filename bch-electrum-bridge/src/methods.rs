@@ -647,8 +647,10 @@ pub async fn call(session: &Arc<Session>, method: &str, params: &[Value]) -> Res
         }
         "mempool.get_fee_histogram" => Ok(json!(fee_histogram(&client.mempool_summary().fee_rates))),
         "mempool.get_info" => {
+            // What Fulcrum keeps of BCHN's getmempoolinfo: BCHN has no
+            // incremental relay fee, unbroadcast count or full RBF.
             let relay = client.fee_estimate().relay as f64 / 1e8;
-            Ok(json!({"mempoolminfee": relay, "minrelaytxfee": relay, "incrementalrelayfee": relay}))
+            Ok(json!({"mempoolminfee": relay, "minrelaytxfee": relay}))
         }
 
         "blockchain.rpa.get_history" => {

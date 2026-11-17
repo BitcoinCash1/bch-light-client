@@ -769,4 +769,23 @@ async fn rpa_and_dsproof_methods() {
     assert!(stats["block_bytes"].as_u64().unwrap() > 0);
     let passthrough = w.reply("daemon.passthrough", json!([])).await;
     assert_eq!(passthrough["error"]["code"], json!(-32601));
+    // Named, as Fulcrum takes them: still no node RPC, the code Fulcrum
+    // gives when passthrough is off. Elsewhere an object is a bad parameter.
+    let named = w
+        .reply(
+            "daemon.passthrough",
+            json!({"method": "getblockcount", "params": []}),
+        )
+        .await;
+    assert_eq!(named["error"]["code"], json!(-32601));
+    let object = w
+        .reply("blockchain.transaction.get", json!({"tx_hash": first_id}))
+        .await;
+    assert_eq!(object["error"]["code"], json!(-32602));
+    // What Fulcrum keeps of BCHN's getmempoolinfo.
+    let info = w.call("mempool.get_info", json!([])).await;
+    assert_eq!(
+        info,
+        json!({"mempoolminfee": 0.00001, "minrelaytxfee": 0.00001})
+    );
 }

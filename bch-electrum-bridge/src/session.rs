@@ -193,14 +193,17 @@ async fn handle_request(session: &Arc<Session>, request: Value) -> Option<Value>
             RpcError::new(-32600, "invalid request"),
         ));
     };
+    // Named parameters (daemon.passthrough takes them on Fulcrum) arrive as
+    // one positional argument; a method that wants positional ones refuses it.
     let params = match request.get("params") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(a)) => a.clone(),
+        Some(object @ Value::Object(_)) => vec![object.clone()],
         Some(_) => {
             return id.map(|id| {
                 error_reply(
                     id,
-                    RpcError::params("only positional parameters are supported"),
+                    RpcError::params("parameters must be a list or an object"),
                 )
             });
         }
