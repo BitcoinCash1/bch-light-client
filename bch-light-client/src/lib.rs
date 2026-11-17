@@ -78,6 +78,7 @@ pub mod mempool;
 pub mod p2p;
 pub mod params;
 pub mod pow;
+pub mod rpa;
 pub mod scan;
 pub mod tx;
 
