@@ -1299,11 +1299,15 @@ async fn sync_loop(inner: Arc<Inner>) {
 
 async fn sync_once(inner: &Arc<Inner>) -> Result<()> {
     let _guard = inner.sync_lock.lock().await;
+    // Headers from a node that serves filters: it has the blocks whose
+    // filters are asked for next. A relay node may be a block ahead of it,
+    // and a filter request for a block the node does not have yet waits out
+    // the timeout.
     let peer = inner
         .pool
-        .wait_peer(inner.config.request_timeout)
+        .wait_filter_peer(inner.config.request_timeout)
         .await
-        .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no peer connected"))?;
+        .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no peer that serves filters"))?;
     sync_headers(inner, &peer).await?;
     filters::sync(inner, FilterKind::Script).await?;
     if let Err(e) = filters::sync(inner, FilterKind::Rpa).await {

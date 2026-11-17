@@ -101,23 +101,64 @@ async fn a_node_without_filters_relays_and_is_never_asked_for_filters() {
         .await;
     }
 
-    // New blocks: headers and blocks from either, filters from the first,
-    // each well inside the timeout a filter request to the relay node would
-    // wait; both connections stay up.
-    for height in 111..=114 {
-        filters.generate(1).await;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            client.poke();
-            let status = client.status();
-            if status.synced && status.filter_height == Some(height) {
-                assert_eq!(status.peers, 2, "{status:?}");
-                break;
+    // New blocks, mined on the relay node as BCHN mines them for kth: it
+    // announces each before the other node may have it. Headers and filters
+    // come from the node that serves filters, blocks from either, each well
+    // inside the timeout a filter request for a block the node does not have
+    // would wait; both connections stay up.
+    let synced_at = |height: u32| {
+        let client = client.clone();
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                client.poke();
+                let status = client.status();
+                if status.synced && status.filter_height == Some(height) {
+                    assert_eq!(status.peers, 2, "{status:?}");
+                    return;
+                }
+                assert!(Instant::now() < deadline, "no block {height}: {status:?}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            assert!(Instant::now() < deadline, "no block {height}: {status:?}");
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    };
+    for height in 111..=112 {
+        relay.generate(1).await;
+        synced_at(height).await;
     }
     assert!(!client.in_mempool(&sent));
+
+    // The relay node alone mines two blocks: the client hears of them from
+    // it, but takes headers only from the node that serves filters, so it
+    // never asks that node for the filters of blocks it does not have.
+    relay
+        .rpc("addnode", json!([filters.peer(), "remove"]))
+        .await;
+    wait_for("the nodes part", || async {
+        relay
+            .rpc("getpeerinfo", json!([]))
+            .await
+            .as_array()
+            .is_some_and(|peers| peers.len() == 1)
+    })
+    .await;
+    let mined = relay.generate(2).await;
+    let quiet = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < quiet {
+        client.poke();
+        let status = client.status();
+        assert_eq!(
+            (status.header_height, status.filter_height, status.peers),
+            (112, Some(112), 2),
+            "{status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Once the other node has them, they come from it.
+    for hash in &mined {
+        let raw = relay.rpc("getblock", json!([hash, false])).await;
+        filters.rpc("submitblock", json!([raw])).await;
+    }
+    synced_at(114).await;
     client.shutdown();
 }
