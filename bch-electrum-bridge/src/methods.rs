@@ -665,20 +665,23 @@ pub async fn call(session: &Arc<Session>, method: &str, params: &[Value]) -> Res
             if client.rpa_heights().is_none() {
                 return Err(RpcError::not_found("RPA support is disabled on this server"));
             }
-            Ok(json!(client
-                .rpa_mempool(prefix)
-                .iter()
-                .map(|m| {
-                    let mut row = json!({
-                        "tx_hash": m.tx.txid().to_hex(),
-                        "height": if m.unconfirmed_parent { -1 } else { 0 },
-                    });
-                    if let Some(fee) = m.fee {
-                        row["fee"] = json!(fee);
-                    }
-                    row
-                })
-                .collect::<Vec<_>>()))
+            let mut rows = Vec::new();
+            for m in client.rpa_mempool(prefix) {
+                let txid = m.tx.txid();
+                let mut row = json!({
+                    "tx_hash": txid.to_hex(),
+                    "height": if m.unconfirmed_parent { -1 } else { 0 },
+                });
+                let fee = match m.fee {
+                    Some(fee) => Some(fee),
+                    None => client.mempool_fee(txid).await,
+                };
+                if let Some(fee) = fee {
+                    row["fee"] = json!(fee);
+                }
+                rows.push(row);
+            }
+            Ok(json!(rows))
         }
         "blockchain.transaction.dsproof.get" => {
             let hash = hash_arg(params, 0, "Invalid dsp hash or tx hash")?;

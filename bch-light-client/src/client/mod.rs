@@ -629,19 +629,63 @@ impl LightClient {
         }
     }
 
-    /// A target's confirmed and unconfirmed history.
+    /// A target's confirmed and unconfirmed history. A mempool transaction
+    /// whose fee is unknown gets it from the transactions it spends, looked
+    /// up by ID (see [`LightClient::mempool_fee`]).
     pub async fn history(&self, target: &Target) -> Result<History> {
         self.ready(target).await?;
-        let states = self.inner.targets.lock().expect("targets lock");
-        let state = states
-            .get(&target.key())
-            .ok_or_else(|| Error::new(ErrorKind::Stopped, "target removed"))?;
-        let mempool = self.inner.mempool.read().expect("mempool lock");
-        Ok(History {
-            synced_height: state.synced_to,
-            confirmed: state.txs.clone(),
-            mempool: mempool_entries(state, &mempool),
-        })
+        let mut history = {
+            let states = self.inner.targets.lock().expect("targets lock");
+            let state = states
+                .get(&target.key())
+                .ok_or_else(|| Error::new(ErrorKind::Stopped, "target removed"))?;
+            let mempool = self.inner.mempool.read().expect("mempool lock");
+            History {
+                synced_height: state.synced_to,
+                confirmed: state.txs.clone(),
+                mempool: mempool_entries(state, &mempool),
+            }
+        };
+        for entry in history.mempool.iter_mut().filter(|e| e.fee.is_none()) {
+            entry.fee = self.mempool_fee(entry.txid).await;
+        }
+        Ok(history)
+    }
+
+    /// The fee of a mempool transaction. When the copy does not know the
+    /// value of an output it spends (one older than the last blocks, of no
+    /// watched script), the spent transaction is looked up by ID, which may
+    /// download its block; the fee found is kept. None when a spent
+    /// transaction cannot be found, as without transaction keys in the
+    /// filters.
+    pub async fn mempool_fee(&self, txid: Txid) -> Option<u64> {
+        let entry = self
+            .inner
+            .mempool
+            .read()
+            .expect("mempool lock")
+            .get(&txid)?;
+        if entry.fee.is_some() {
+            return entry.fee;
+        }
+        let mut inputs = 0u64;
+        for input in &entry.tx.inputs {
+            let value = match known_value(&self.inner, &input.prevout) {
+                Some(value) => value,
+                None => {
+                    let parent = self.transaction(input.prevout.txid, None).await.ok()?;
+                    parent.tx.outputs.get(input.prevout.vout as usize)?.value
+                }
+            };
+            inputs = inputs.checked_add(value)?;
+        }
+        let fee = inputs.checked_sub(entry.tx.outputs.iter().map(|o| o.value).sum())?;
+        self.inner
+            .mempool
+            .write()
+            .expect("mempool lock")
+            .set_fee(&txid, fee);
+        Some(fee)
     }
 
     pub async fn balance(&self, target: &Target, tokens: TokenFilter) -> Result<Balance> {
@@ -1041,6 +1085,34 @@ fn mempool_entries(state: &TargetState, mempool: &Mempool) -> Vec<MempoolEntry> 
     let mut out: Vec<MempoolEntry> = entries.into_values().collect();
     out.sort_by_cached_key(|e| (e.unconfirmed_parent, e.txid.to_hex()));
     out
+}
+
+/// The value of an output the client knows without a lookup: of a mempool
+/// transaction, of the last blocks, or a watched coin.
+fn known_value(inner: &Inner, outpoint: &OutPoint) -> Option<u64> {
+    if let Some(value) = inner
+        .mempool
+        .read()
+        .expect("mempool lock")
+        .output_value(outpoint)
+    {
+        return Some(value);
+    }
+    if let Some(output) = inner
+        .recent
+        .lock()
+        .expect("recent lock")
+        .outputs
+        .get(outpoint)
+    {
+        return Some(output.value);
+    }
+    inner
+        .targets
+        .lock()
+        .expect("targets lock")
+        .values()
+        .find_map(|s| s.coins.get(outpoint).map(|c| c.value))
 }
 
 fn new_entry(entry: &crate::mempool::MempoolTx, mempool: &Mempool) -> MempoolEntry {
