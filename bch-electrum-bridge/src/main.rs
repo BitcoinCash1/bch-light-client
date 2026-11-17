@@ -6,6 +6,7 @@ mod methods;
 mod session;
 
 use bch_light_client::{Config, LightClient, Network};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -32,16 +33,34 @@ Options:
   --rpa-from HEIGHT       where input prefix filters start (default: the network's RPA start, or the birthday)
   --rpa-cover N           with each RPA search also fetch the blocks of N random other prefixes
   --dns-seeds             also find nodes through the network's DNS seeds (not used behind a proxy)
-  --listen ADDR:PORT      where wallets connect (default 127.0.0.1:50001)
+  --listen ADDR:PORT      where wallets on this machine connect: a loopback address
+                          only (default 127.0.0.1:50001)
   --banner TEXT           what server.banner answers
   --donation-address ADDR what server.donation_address answers
   -h, --help              this text";
 
 pub struct Options {
     pub config: Config,
-    pub listen: String,
+    /// Loopback addresses only.
+    pub listen: Vec<SocketAddr>,
     pub banner: String,
     pub donation_address: String,
+}
+
+/// The addresses of `listen`, which must all be loopback: the bridge serves
+/// wallets on this machine only.
+fn loopback(listen: &str) -> Result<Vec<SocketAddr>, String> {
+    let addrs: Vec<SocketAddr> = listen
+        .to_socket_addrs()
+        .map_err(|e| format!("--listen {listen}: {e}"))?
+        .collect();
+    if addrs.is_empty() || addrs.iter().any(|a| !a.ip().is_loopback()) {
+        return Err(format!(
+            "--listen {listen}: the bridge listens on a loopback address only \
+             (such as 127.0.0.1 or [::1]), for wallets on this machine"
+        ));
+    }
+    Ok(addrs)
 }
 
 fn parse_args(args: Vec<String>) -> Result<Options, String> {
@@ -104,6 +123,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
     if peers.is_empty() && !dns_seeds {
         return Err("give at least one --peer, or --dns-seeds".to_string());
     }
+    let listen = loopback(&listen)?;
     let mut config = Config::new(network, datadir, peers);
     config.proxy = proxy;
     config.isolate_block_downloads = isolate.or(config.isolate_block_downloads);
@@ -152,14 +172,17 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let listener = match TcpListener::bind(&options.listen).await {
+    let listener = match TcpListener::bind(&options.listen[..]).await {
         Ok(l) => l,
         Err(e) => {
-            error!(error = %e, listen = %options.listen, "could not listen");
+            error!(error = %e, listen = ?options.listen, "could not listen");
             std::process::exit(1);
         }
     };
-    info!(listen = %options.listen, %network, "waiting for headers and filters before serving wallets");
+    let listen = listener
+        .local_addr()
+        .map_or_else(|_| format!("{:?}", options.listen), |a| a.to_string());
+    info!(%listen, %network, "waiting for headers and filters before serving wallets");
     loop {
         match client.wait_synced(Duration::from_secs(60)).await {
             Ok(status) => {
@@ -213,5 +236,33 @@ mod tests {
         assert_eq!(o.config.decoy_blocks, 2);
         assert!(parse_args(vec![]).is_err());
         assert!(ABOUT.contains("do not support the Bitcoin Cash P2P protocol"));
+        assert_eq!(o.listen, vec!["127.0.0.1:50001".parse().unwrap()]);
+    }
+
+    #[test]
+    fn the_bridge_listens_on_loopback_only() {
+        let listen = |addr: &str| {
+            parse_args(
+                ["--peer", "127.0.0.1:1", "--listen", addr]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            )
+            .map(|o| o.listen)
+        };
+        assert_eq!(
+            listen("[::1]:50001"),
+            Ok(vec!["[::1]:50001".parse().unwrap()])
+        );
+        assert!(listen("127.0.0.2:50001").is_ok());
+        for wide in [
+            "0.0.0.0:50001",
+            "[::]:50001",
+            "192.168.0.10:50001",
+            "10.1.2.3:1",
+        ] {
+            let error = listen(wide).unwrap_err();
+            assert!(error.contains("loopback address only"), "{wide}: {error}");
+        }
     }
 }

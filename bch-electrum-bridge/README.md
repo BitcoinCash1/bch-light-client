@@ -18,6 +18,9 @@ Run it beside the wallet, on the same machine, and point the wallet at it:
         --peer node1.example:8333 --peer node2.example:8333 \
         [--proxy 127.0.0.1:9050] [--birthday HEIGHT] --listen 127.0.0.1:50001
 
+It listens on a loopback address only, and refuses any other `--listen`:
+it serves wallets on this machine, never a network.
+
 At least one node must serve script filters (filter type 1); for
 `blockchain.rpa.*` one must also serve input prefix filters (type 2). Every
 `--peer` is connected. A node that serves no filters, such as BCHN, is kept
