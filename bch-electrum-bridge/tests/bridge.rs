@@ -415,15 +415,15 @@ async fn electrum_answers_match_bchd() {
         .unwrap()
         .contains("rejected"));
 
-    // Not yet: RPA and double-spend proofs; fees from what the client sees.
-    let rpa = w
-        .reply("blockchain.rpa.get_history", json!(["ab", 0]))
-        .await;
-    assert_eq!(rpa["error"]["code"], json!(-32601));
+    // This bchd serves no input prefix filters: an RPA search finds nothing
+    // (rpa_and_dsproof_methods runs against one that does). No proof is
+    // known for a transaction nobody double-spent. Fees from what the client sees.
+    let rpa = w.call("blockchain.rpa.get_history", json!(["ab", 0])).await;
+    assert_eq!(rpa, json!([]));
     let dsp = w
-        .reply("blockchain.transaction.dsproof.get", json!([sent]))
+        .call("blockchain.transaction.dsproof.get", json!([sent]))
         .await;
-    assert_eq!(dsp["error"]["code"], json!(-32601));
+    assert_eq!(dsp, Value::Null);
     let fee = w.call("blockchain.estimatefee", json!([2])).await;
     assert!(fee.as_f64().unwrap() >= 0.00001);
     assert!(w
@@ -434,4 +434,240 @@ async fn electrum_answers_match_bchd() {
         w.call("blockchain.relayfee", json!([])).await,
         json!(0.00001)
     );
+}
+
+fn bchd_rpa_binary() -> Option<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("BCHD_RPA_BIN") {
+        return Some(path.into());
+    }
+    let exe = if cfg!(windows) {
+        "bchd-rpa.exe"
+    } else {
+        "bchd-rpa"
+    };
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(".tools")
+        .join(exe);
+    path.exists().then_some(path)
+}
+
+fn rpa_value(outpoint: OutPoint, sequence: u32) -> u16 {
+    let mut b = outpoint.txid.0.to_vec();
+    b.extend_from_slice(&outpoint.vout.to_le_bytes());
+    b.extend_from_slice(&[0x02, 0x01, 0x51]);
+    b.extend_from_slice(&sequence.to_le_bytes());
+    let h = hash256(&b);
+    u16::from_be_bytes([h[0], h[1]])
+}
+
+/// A version 1 spend of a P2SH(OP_TRUE) coin whose input value is `prefix` (16 bits).
+fn ground_spend(outpoint: OutPoint, value: u64, prefix: u16, script: &[u8]) -> Vec<u8> {
+    let sequence = (0u32..)
+        .find(|s| rpa_value(outpoint, *s) == prefix)
+        .unwrap();
+    let mut tx = 1i32.to_le_bytes().to_vec();
+    tx.push(1);
+    tx.extend_from_slice(&outpoint.txid.0);
+    tx.extend_from_slice(&outpoint.vout.to_le_bytes());
+    tx.extend_from_slice(&[0x02, 0x01, 0x51]);
+    tx.extend_from_slice(&sequence.to_le_bytes());
+    tx.push(1);
+    tx.extend_from_slice(&(value - 3000).to_le_bytes());
+    tx.push(script.len() as u8);
+    tx.extend_from_slice(script);
+    tx.extend_from_slice(&0u32.to_le_bytes());
+    tx
+}
+
+/// RPA searches and double-spend proofs through the bridge, with Fulcrum's
+/// argument order, limits and result shapes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpa_and_dsproof_methods() {
+    let Some(bin) = bchd_rpa_binary() else {
+        eprintln!("skipped: no bchd with input prefix filters (set BCHD_RPA_BIN)");
+        return;
+    };
+    let node = Bchd::start_with(&bin, "bridge-rpa").await;
+    node.generate(110).await;
+    let mining = mining_script();
+    let key = Key::new(31);
+    let (cb1, v1) = node.coinbase(1).await;
+    let fund = TxSpec {
+        inputs: vec![(cb1, Unlock::Redeem(vec![0x51]))],
+        outputs: vec![
+            (500_000_000, key.script(), vec![]),
+            (v1 - 500_000_000 - 3000, mining.clone(), vec![]),
+        ],
+    }
+    .build();
+    node.send(&fund).await;
+    node.generate(1).await;
+
+    let port = free_port();
+    let log = std::fs::File::create(node.dir.join("bridge.log")).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_bch-electrum-bridge"))
+        .args([
+            "--network",
+            "regtest",
+            "--peer",
+            &node.peer(),
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .arg("--datadir")
+        .arg(node.dir.join("bridge-data"))
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("start bridge");
+    let _bridge = Bridge { child };
+    let mut w = Wallet::connect(port).await;
+    w.call("server.version", json!(["test-wallet", "1.5"]))
+        .await;
+    let features = w.call("server.features", json!([])).await;
+    assert_eq!(features["dsproof"], json!(true));
+    assert_eq!(features["rpa"]["prefix_bits_min"], json!(8));
+    assert_eq!(features["rpa"]["history_block_limit"], json!(60));
+    wait_bridge_tip(&mut w, 111).await;
+
+    // A payment ground to the prefix beef, seen first in the mempool.
+    let (cb2, v2) = node.coinbase(2).await;
+    let pay = ground_spend(cb2, v2, 0xbeef, &mining);
+    let pay_id = node.send(&pay).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let pending = w.call("blockchain.rpa.get_mempool", json!(["beef"])).await;
+        if pending
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["tx_hash"] == json!(pay_id))
+        {
+            assert_eq!(pending[0]["height"], json!(0));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the payment did not reach the mempool copy"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    node.generate(1).await;
+    wait_bridge_tip(&mut w, 112).await;
+    let rows = w
+        .call("blockchain.rpa.get_history", json!(["beef", 100]))
+        .await;
+    assert_eq!(rows, json!([{"tx_hash": pay_id, "height": 112}]));
+    // 8 bits of the same prefix find it too; another 16-bit prefix does not.
+    let rows8 = w
+        .call("blockchain.rpa.get_history", json!(["be", 100, 113]))
+        .await;
+    assert!(rows8
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["tx_hash"] == json!(pay_id)));
+    assert_eq!(
+        w.call("blockchain.rpa.get_history", json!(["beee", 100]))
+            .await,
+        json!([])
+    );
+    // At most 60 blocks per call, from `from`: from 0 never reaches 112.
+    assert_eq!(
+        w.call("blockchain.rpa.get_history", json!(["beef", 0]))
+            .await,
+        json!([])
+    );
+    // A to_height at or below from_height: nothing.
+    assert_eq!(
+        w.call("blockchain.rpa.get_history", json!(["beef", 112, 112]))
+            .await,
+        json!([])
+    );
+    // The older form: (from, count, prefix).
+    let legacy = w
+        .call("blockchain.reusable.get_history", json!([110, 5, "beef"]))
+        .await;
+    assert_eq!(legacy, json!([{"tx_hash": pay_id, "height": 112}]));
+    // Fewer than 8 bits are refused.
+    let short = w
+        .reply("blockchain.rpa.get_history", json!(["b", 100]))
+        .await;
+    assert_eq!(short["error"]["code"], json!(-32602));
+
+    // A double spend: the proof reaches the subscriber.
+    let coin = OutPoint::new(txid_of(&fund), 0);
+    let first = TxSpec {
+        inputs: vec![(coin, Unlock::Sign(&key, 500_000_000))],
+        outputs: vec![(499_990_000, mining.clone(), vec![])],
+    }
+    .build();
+    let second = TxSpec {
+        inputs: vec![(coin, Unlock::Sign(&key, 500_000_000))],
+        outputs: vec![(499_980_000, p2sh32(&[0x57, 0x75, 0x51]), vec![])],
+    }
+    .build();
+    let first_id = node.send(&first).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let height = w
+            .call("blockchain.transaction.subscribe", json!([first_id]))
+            .await;
+        if height == json!(0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the first spend did not reach the mempool copy"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        w.call(
+            "blockchain.transaction.dsproof.subscribe",
+            json!([first_id])
+        )
+        .await,
+        Value::Null
+    );
+    assert!(node
+        .try_rpc("sendrawtransaction", json!([hex::encode(&second)]))
+        .await
+        .is_err());
+    let note = w
+        .notification("blockchain.transaction.dsproof.subscribe")
+        .await;
+    assert_eq!(note["params"][0], json!(first_id));
+    let proof = note["params"][1].clone();
+    assert_eq!(proof["txid"], json!(first_id));
+    assert_eq!(
+        proof["outpoint"],
+        json!({"txid": coin.txid.to_hex(), "vout": 0})
+    );
+    assert_eq!(proof["descendants"], json!([first_id]));
+    let theirs = node.rpc("getdsproof", json!([first_id])).await;
+    assert_eq!(proof["dspid"], theirs["dspid"]);
+    assert_eq!(
+        w.call("blockchain.transaction.dsproof.get", json!([first_id]))
+            .await,
+        proof
+    );
+    assert_eq!(
+        w.call(
+            "blockchain.transaction.dsproof.get",
+            json!([proof["dspid"]])
+        )
+        .await,
+        proof
+    );
+    assert_eq!(
+        w.call("blockchain.transaction.dsproof.list", json!([]))
+            .await,
+        json!([first_id])
+    );
+    let stats = w.call("light_client.stats", json!([])).await;
+    assert!(stats["block_bytes"].as_u64().unwrap() > 0);
+    let passthrough = w.reply("daemon.passthrough", json!([])).await;
+    assert_eq!(passthrough["error"]["code"], json!(-32601));
 }

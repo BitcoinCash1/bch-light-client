@@ -69,6 +69,8 @@ pub struct SessionState {
     pub headers: bool,
     pub scripts: HashMap<FilterKey, ScriptSub>,
     pub txs: HashMap<Txid, Value>,
+    /// Transactions whose double-spend proofs are followed, with the last status.
+    pub dsproofs: HashMap<Txid, Value>,
 }
 
 pub struct Session {
@@ -102,6 +104,7 @@ pub async fn run(shared: Arc<Shared>, stream: TcpStream) {
             headers: false,
             scripts: HashMap::new(),
             txs: HashMap::new(),
+            dsproofs: HashMap::new(),
         }),
     });
     let writer = tokio::spawn(async move {
@@ -258,6 +261,7 @@ async fn follow_events(session: Arc<Session>, mut events: broadcast::Receiver<Ev
                 }
             }
             Event::Reorg { .. } => refresh_all(&session).await,
+            Event::DoubleSpendProof { .. } => refresh_dsproofs(&session),
         }
     }
 }
@@ -305,6 +309,41 @@ async fn refresh_script(session: &Arc<Session>, key: FilterKey) {
     };
     for (method, name) in notify {
         session.notify(method, json!([name, status]));
+    }
+}
+
+/// Sends the new proof status of each followed transaction that changed.
+fn refresh_dsproofs(session: &Session) {
+    let followed: Vec<Txid> = session
+        .state
+        .lock()
+        .expect("session lock")
+        .dsproofs
+        .keys()
+        .copied()
+        .collect();
+    for txid in followed {
+        let status = session
+            .shared
+            .client
+            .ds_proof(txid.0)
+            .map_or(Value::Null, |p| methods::dsproof_json(&p));
+        let changed = {
+            let mut state = session.state.lock().expect("session lock");
+            match state.dsproofs.get_mut(&txid) {
+                Some(old) if *old != status => {
+                    *old = status.clone();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            session.notify(
+                "blockchain.transaction.dsproof.subscribe",
+                json!([txid.to_hex(), status]),
+            );
+        }
     }
 }
 

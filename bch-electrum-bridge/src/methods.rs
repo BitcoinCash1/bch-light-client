@@ -4,8 +4,8 @@ use crate::session::{RpcError, ScriptSub, Session};
 use bch_light_client::block::BlockHeader;
 use bch_light_client::cashaddr::Address;
 use bch_light_client::{
-    BlockHash, ErrorKind, History, LightClient, OutPoint, Target, TokenData, TokenFilter,
-    Transaction, Txid,
+    BlockHash, DsProofInfo, ErrorKind, History, LightClient, OutPoint, Prefix, Target, TokenData,
+    TokenFilter, Transaction, Txid,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -361,17 +361,29 @@ pub async fn call(session: &Arc<Session>, method: &str, params: &[Value]) -> Res
         "server.ping" => Ok(Value::Null),
         "server.peers.subscribe" => Ok(json!([])),
         "server.add_peer" => Ok(json!(false)),
-        "server.features" => Ok(json!({
-            "genesis_hash": session.shared.network.params().genesis_hash().to_hex(),
-            "hosts": {},
-            "protocol_min": version_string(PROTOCOL_MIN),
-            "protocol_max": version_string(PROTOCOL_MAX),
-            "server_version": SERVER_VERSION,
-            "hash_function": "sha256",
-            "pruning": null,
-            "dsproof": false,
-            "cashtokens": true,
-        })),
+        "server.features" => {
+            let mut features = json!({
+                "genesis_hash": session.shared.network.params().genesis_hash().to_hex(),
+                "hosts": {},
+                "protocol_min": version_string(PROTOCOL_MIN),
+                "protocol_max": version_string(PROTOCOL_MAX),
+                "server_version": SERVER_VERSION,
+                "hash_function": "sha256",
+                "pruning": null,
+                "dsproof": true,
+                "cashtokens": true,
+            });
+            if let Some((start, _)) = client.rpa_heights() {
+                features["rpa"] = json!({
+                    "prefix_bits_min": RPA_PREFIX_BITS_MIN,
+                    "prefix_bits": 16,
+                    "starting_height": start,
+                    "history_block_limit": RPA_HISTORY_BLOCK_LIMIT,
+                    "max_history": RPA_MAX_HISTORY,
+                });
+            }
+            Ok(features)
+        }
 
         "blockchain.headers.subscribe" | "blockchain.headers.get_tip" => {
             if method == "blockchain.headers.subscribe" {
@@ -629,22 +641,183 @@ pub async fn call(session: &Arc<Session>, method: &str, params: &[Value]) -> Res
             Ok(json!({"mempoolminfee": relay, "minrelaytxfee": relay, "incrementalrelayfee": relay}))
         }
 
-        "blockchain.rpa.get_history" | "blockchain.rpa.get_mempool" | "blockchain.reusable.get_history"
-        | "blockchain.reusable.get_mempool" => Err(RpcError::not_found(
-            "RPA lookups are not available yet: they need input prefix filters (filter type 2), planned for phase 2",
-        )),
-        "blockchain.transaction.dsproof.get"
-        | "blockchain.transaction.dsproof.list"
-        | "blockchain.transaction.dsproof.subscribe"
-        | "blockchain.transaction.dsproof.unsubscribe" => {
-            Err(RpcError::not_found("This server lacks dsproof support (not available yet, planned for phase 2)"))
+        "blockchain.rpa.get_history" => {
+            let prefix = rpa_prefix_arg(params, 0)?;
+            let from = from_height_arg(params, 1)?;
+            let to = to_height_arg(params, 2, from)?;
+            rpa_history(client, prefix, from, to).await
+        }
+        "blockchain.reusable.get_history" => {
+            // The older form: (from, count, prefix).
+            let prefix = rpa_prefix_arg(params, 2)?;
+            let from = from_height_arg(params, 0)?;
+            let count = arg(params, 1)
+                .and_then(Value::as_i64)
+                .filter(|c| *c >= 0)
+                .ok_or_else(|| RpcError::params("Bad count argument"))?;
+            let to = from.saturating_add(u32::try_from(count).unwrap_or(u32::MAX));
+            rpa_history(client, prefix, from, Some(to)).await
+        }
+        "blockchain.rpa.get_mempool" | "blockchain.reusable.get_mempool" => {
+            let prefix = rpa_prefix_arg(params, 0)?;
+            if client.rpa_heights().is_none() {
+                return Err(RpcError::not_found("RPA support is disabled on this server"));
+            }
+            Ok(json!(client
+                .rpa_mempool(prefix)
+                .iter()
+                .map(|m| {
+                    let mut row = json!({
+                        "tx_hash": m.tx.txid().to_hex(),
+                        "height": if m.unconfirmed_parent { -1 } else { 0 },
+                    });
+                    if let Some(fee) = m.fee {
+                        row["fee"] = json!(fee);
+                    }
+                    row
+                })
+                .collect::<Vec<_>>()))
+        }
+        "blockchain.transaction.dsproof.get" => {
+            let hash = hash_arg(params, 0, "Invalid dsp hash or tx hash")?;
+            Ok(client.ds_proof(hash).map_or(Value::Null, |p| dsproof_json(&p)))
+        }
+        "blockchain.transaction.dsproof.list" => {
+            let mut txids: Vec<String> = client
+                .ds_proofs()
+                .iter()
+                .flat_map(|p| p.descendants.iter().map(|t| t.to_hex()))
+                .collect();
+            txids.sort();
+            txids.dedup();
+            Ok(json!(txids))
+        }
+        "blockchain.transaction.dsproof.subscribe" => {
+            let txid = txid_arg(params, 0)?;
+            let current = client.ds_proof(txid.0).map_or(Value::Null, |p| dsproof_json(&p));
+            session.state.lock().expect("session lock").dsproofs.insert(txid, current.clone());
+            Ok(current)
+        }
+        "blockchain.transaction.dsproof.unsubscribe" => {
+            let txid = txid_arg(params, 0)?;
+            Ok(json!(session.state.lock().expect("session lock").dsproofs.remove(&txid).is_some()))
+        }
+        "light_client.stats" => {
+            let stats = client.stats();
+            let status = client.status();
+            Ok(json!({
+                "header_bytes": stats.headers,
+                "filter_bytes": stats.filters,
+                "block_bytes": stats.blocks,
+                "blocks_downloaded": stats.blocks_downloaded,
+                "header_height": status.header_height,
+                "filter_height": status.filter_height,
+                "rpa_height": status.rpa_height,
+                "peers": status.peers,
+            }))
         }
         "blockchain.transaction.broadcast_package" => {
             Err(RpcError::not_found("blockchain.transaction.broadcast_package is not available on Bitcoin Cash"))
         }
-        "daemon.passthrough" => Err(RpcError::not_found("there is no node RPC behind this server")),
+        "daemon.passthrough" => Err(RpcError::not_found(
+            "daemon.passthrough is not available: this server is a P2P light client and has no node RPC behind it",
+        )),
         _ => Err(RpcError::not_found(format!("unknown method '{method}'"))),
     }
+}
+
+/// Fulcrum's RPA limits: queries of at least 8 bits, 60 blocks per call.
+const RPA_PREFIX_BITS_MIN: u8 = 8;
+const RPA_HISTORY_BLOCK_LIMIT: u32 = 60;
+const RPA_MAX_HISTORY: usize = 125_000;
+
+fn rpa_prefix_arg(params: &[Value], i: usize) -> Result<Prefix> {
+    let bad = || {
+        RpcError::params(format!(
+            "Invalid prefix argument; expected hex string of at least {} and at most 4 characters",
+            RPA_PREFIX_BITS_MIN / 4
+        ))
+    };
+    let text = arg(params, i).and_then(Value::as_str).ok_or_else(bad)?;
+    let prefix = Prefix::from_hex(text).map_err(|_| bad())?;
+    if prefix.bits < RPA_PREFIX_BITS_MIN {
+        return Err(bad());
+    }
+    Ok(prefix)
+}
+
+fn from_height_arg(params: &[Value], i: usize) -> Result<u32> {
+    arg(params, i)
+        .and_then(Value::as_i64)
+        .filter(|n| *n >= 0)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| RpcError::params("Bad from_height argument"))
+}
+
+fn to_height_arg(params: &[Value], i: usize, from: u32) -> Result<Option<u32>> {
+    match arg(params, i).map(Value::as_i64) {
+        None | Some(Some(-1)) => Ok(None),
+        Some(Some(n)) if n >= i64::from(from) => Ok(Some(u32::try_from(n).unwrap_or(u32::MAX))),
+        _ => Err(RpcError::params("Bad to_height argument")),
+    }
+}
+
+/// Fulcrum's rpa.get_history: from the RPA start height on, at most 60
+/// blocks from `from`, confirmed transactions only.
+async fn rpa_history(
+    client: &LightClient,
+    prefix: Prefix,
+    from: u32,
+    to: Option<u32>,
+) -> Result<Value> {
+    let Some((start, tip)) = client.rpa_heights() else {
+        return Err(RpcError::not_found(
+            "RPA support is disabled on this server",
+        ));
+    };
+    if to.is_some_and(|to| to <= from) {
+        return Ok(json!([]));
+    }
+    let tip = tip.or_else(|| client.tip().map(|t| t.0)).unwrap_or(0);
+    let from = from.max(start);
+    let end = to
+        .unwrap_or(tip + 1)
+        .min(tip + 1)
+        .min(from.saturating_add(RPA_HISTORY_BLOCK_LIMIT));
+    if end <= from {
+        return Ok(json!([]));
+    }
+    let found = client.rpa_history(prefix, from, end).await?;
+    if found.len() > RPA_MAX_HISTORY {
+        return Err(RpcError::bad_request(format!(
+            "RPA history too large for prefix '{}'",
+            prefix.to_hex()
+        )));
+    }
+    Ok(json!(found
+        .iter()
+        .filter_map(|m| m
+            .confirmation
+            .map(|c| json!({"tx_hash": m.tx.txid().to_hex(), "height": c.height})))
+        .collect::<Vec<_>>()))
+}
+
+fn hash_arg(params: &[Value], i: usize, what: &str) -> Result<[u8; 32]> {
+    let text = str_arg(params, i, what)?;
+    Txid::from_hex(text)
+        .map(|t| t.0)
+        .map_err(|_| RpcError::params(what.to_string()))
+}
+
+/// A proof as Fulcrum shows one: IDs in display order.
+pub fn dsproof_json(p: &DsProofInfo) -> Value {
+    json!({
+        "dspid": reversed_hex(&p.id),
+        "txid": p.txid.to_hex(),
+        "hex": hex::encode(&p.raw),
+        "outpoint": {"txid": p.outpoint.txid.to_hex(), "vout": p.outpoint.vout},
+        "descendants": p.descendants.iter().map(|t| t.to_hex()).collect::<Vec<_>>(),
+    })
 }
 
 fn target_of(session: &Session, method: &str, params: &[Value]) -> Result<(Target, String)> {

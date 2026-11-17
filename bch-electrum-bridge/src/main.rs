@@ -25,6 +25,11 @@ Options:
   --isolate-blocks        fetch each block over a connection of its own even without a proxy
   --decoy-blocks N        fetch N random extra blocks with each block a scan needs
   --download-all-blocks   fetch every block of a scanned range: which blocks are fetched says nothing
+  --birthday HEIGHT       keep filters, and read histories, from this height on (default: genesis)
+  --no-rpa                do not keep input prefix filters (blockchain.rpa.* then answer method not found)
+  --rpa-from HEIGHT       where input prefix filters start (default: the network's RPA start, or the birthday)
+  --rpa-cover N           with each RPA search also fetch the blocks of N random other prefixes
+  --dns-seeds             also find nodes through the network's DNS seeds (not used behind a proxy)
   --listen ADDR:PORT      where wallets connect (default 127.0.0.1:50001)
   --banner TEXT           what server.banner answers
   --donation-address ADDR what server.donation_address answers
@@ -45,6 +50,11 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
     let mut isolate = None;
     let mut decoys = 0usize;
     let mut all_blocks = false;
+    let mut birthday = 0u32;
+    let mut rpa = true;
+    let mut rpa_from = None;
+    let mut rpa_cover = 0usize;
+    let mut dns_seeds = false;
     let mut listen = "127.0.0.1:50001".to_string();
     let mut banner = String::new();
     let mut donation_address = String::new();
@@ -63,6 +73,25 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                     .map_err(|_| "--decoy-blocks needs a number")?
             }
             "--download-all-blocks" => all_blocks = true,
+            "--birthday" => {
+                birthday = value("--birthday")?
+                    .parse()
+                    .map_err(|_| "--birthday needs a height")?
+            }
+            "--no-rpa" => rpa = false,
+            "--rpa-from" => {
+                rpa_from = Some(
+                    value("--rpa-from")?
+                        .parse()
+                        .map_err(|_| "--rpa-from needs a height")?,
+                )
+            }
+            "--rpa-cover" => {
+                rpa_cover = value("--rpa-cover")?
+                    .parse()
+                    .map_err(|_| "--rpa-cover needs a number")?
+            }
+            "--dns-seeds" => dns_seeds = true,
             "--listen" => listen = value("--listen")?,
             "--banner" => banner = value("--banner")?,
             "--donation-address" => donation_address = value("--donation-address")?,
@@ -70,14 +99,19 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
             other => return Err(format!("unknown option {other}")),
         }
     }
-    if peers.is_empty() {
-        return Err("give at least one --peer".to_string());
+    if peers.is_empty() && !dns_seeds {
+        return Err("give at least one --peer, or --dns-seeds".to_string());
     }
     let mut config = Config::new(network, datadir, peers);
     config.proxy = proxy;
     config.isolate_block_downloads = isolate.or(config.isolate_block_downloads);
     config.decoy_blocks = decoys;
     config.download_all_blocks = all_blocks;
+    config.filters_from_height = birthday;
+    config.rpa_filters = rpa;
+    config.rpa_from_height = rpa_from;
+    config.rpa_cover_prefixes = rpa_cover;
+    config.dns_seeds = dns_seeds;
     if banner.is_empty() {
         banner = format!("bch-electrum-bridge {}: {ABOUT}", env!("CARGO_PKG_VERSION"));
     }
