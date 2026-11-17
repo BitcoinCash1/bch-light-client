@@ -571,7 +571,8 @@ impl LightClient {
             .collect();
         drop(chain);
         let branch = merkle_branch(&leaves, height as usize);
-        let root = crate::block::merkle_fold(leaves[height as usize], height as usize, &branch);
+        let root = crate::block::merkle_fold(leaves[height as usize], height as usize, &branch)
+            .expect("a position of the chain is a true one");
         Ok((branch, root))
     }
 

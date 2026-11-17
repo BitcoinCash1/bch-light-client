@@ -227,7 +227,7 @@ async fn electrum_answers_match_bchd() {
             h
         })
         .collect();
-    let mut root = bch_light_client::block::merkle_fold(leaf, 5, &branch);
+    let mut root = bch_light_client::block::merkle_fold(leaf, 5, &branch).expect("a true position");
     root.reverse();
     assert_eq!(json!(hex::encode(root)), proof["root"]);
     let headers = w.call("blockchain.block.headers", json!([0, 10])).await;

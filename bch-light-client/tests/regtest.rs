@@ -452,7 +452,7 @@ async fn histories_scenario(bin: &std::path::Path, name: &str, txid_keys: bool) 
     let header = pooled.header(proof.height).unwrap();
     assert_eq!(
         bch_light_client::block::merkle_fold(f1id.0, proof.position as usize, &proof.branch),
-        header.merkle_root
+        Some(header.merkle_root)
     );
     let (at, at_proof) = pooled.transaction_at(111, proof.position).await.unwrap();
     assert_eq!(at.txid(), f1id);
@@ -475,7 +475,7 @@ async fn histories_scenario(bin: &std::path::Path, name: &str, txid_keys: bool) 
     let (header_branch, root) = pooled.header_branch(5, tip).unwrap();
     assert_eq!(
         bch_light_client::block::merkle_fold(pooled.header(5).unwrap().hash().0, 5, &header_branch),
-        root
+        Some(root)
     );
     let fees = pooled.fee_estimate();
     assert!(
@@ -503,7 +503,7 @@ async fn histories_scenario(bin: &std::path::Path, name: &str, txid_keys: bool) 
             .expect("proof by ID alone");
         assert_eq!(
             bch_light_client::block::merkle_fold(gid.0, proof.position as usize, &proof.branch),
-            isolated.header(proof.height).unwrap().merkle_root
+            Some(isolated.header(proof.height).unwrap().merkle_root)
         );
         let unspent = isolated.output(OutPoint::new(f1id, 4), None).await.unwrap();
         assert_eq!(unspent.map(|o| o.value), Some(v1 - 2_000_000_000 - FEE));

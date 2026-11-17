@@ -420,7 +420,7 @@ pub fn is_true_leaf(
     let (l, p) = (&leaf.proof.leaf, &leaf.proof);
     let tx = &p.tx;
     if (height > small_tx_until && tx.size() == 64)
-        || merkle_fold(tx.txid().0, l.tx_index as usize, &p.tx_branch) != header.merkle_root
+        || merkle_fold(tx.txid().0, l.tx_index as usize, &p.tx_branch) != Some(header.merkle_root)
         || p.tx_branch.len() > MAX_BRANCH
         || u64::from(l.tx_index) >> p.tx_branch.len() != 0
     {
@@ -445,7 +445,7 @@ pub fn is_true_leaf(
             if origin_height > height
                 || (origin_height > small_tx_until && origin.tx.size() == 64)
                 || merkle_fold(origin.tx.txid().0, origin.tx_index as usize, &origin.branch)
-                    != origin_header.merkle_root
+                    != Some(origin_header.merkle_root)
             {
                 return false;
             }
@@ -639,6 +639,91 @@ mod tests {
         "0151",
         "00000000"
     );
+
+    /// TINY_TX with its lock time set to `n`, spending `prevout` when given.
+    fn tiny_tx(n: u8, prevout: Option<[u8; 32]>) -> Transaction {
+        let mut raw = hex::decode(TINY_TX).unwrap();
+        if let Some(txid) = prevout {
+            raw[5..37].copy_from_slice(&txid);
+            raw[37..41].copy_from_slice(&0u32.to_le_bytes());
+        }
+        let len = raw.len();
+        raw[len - 4] = n;
+        Transaction::from_bytes(&raw).unwrap()
+    }
+
+    fn header_over(txs: &[&Transaction]) -> BlockHeader {
+        let txids: Vec<crate::hash::Txid> = txs.iter().map(|t| t.txid()).collect();
+        BlockHeader {
+            version: 1,
+            prev_hash: BlockHash::ZERO,
+            merkle_root: crate::block::merkle_root(&txids).0,
+            time: 0,
+            bits: 0,
+            nonce: 0,
+        }
+    }
+
+    /// A block of three transactions: the last pairs with itself, so the
+    /// branch of position 2 also folds to the root from position 3 (the
+    /// duplicate pairing of CVE-2012-2459). A peer that claims a leaf there,
+    /// or a spent output created there, lies and must lose the dispute.
+    #[test]
+    fn a_leaf_at_a_phantom_position_is_not_true() {
+        let txs: Vec<Transaction> = (0u8..3).map(|i| tiny_tx(i, None)).collect();
+        let header = header_over(&txs.iter().collect::<Vec<_>>());
+        let ids: Vec<[u8; 32]> = txs.iter().map(|t| t.txid().0).collect();
+        let branch = crate::block::merkle_branch(&ids, 2);
+        let key = FilterKey::script(&[0x51]).0;
+        let proved =
+            |kind, tx_index, tx: &Transaction, tx_branch: Vec<[u8; 32]>, origin| ProvedLeaf {
+                proof: CfProof {
+                    block: BlockHash::ZERO,
+                    leaf_count: 1,
+                    leaf_index: 0,
+                    leaf: Leaf {
+                        key,
+                        tx_index,
+                        index: 0,
+                        kind,
+                    },
+                    leaf_branch: vec![],
+                    tx: tx.clone(),
+                    tx_branch,
+                    origin,
+                },
+                lefts: vec![],
+            };
+        let none = |_: &BlockHash| None;
+        let output = |tx_index| proved(LeafKind::Output, tx_index, &txs[2], branch.clone(), None);
+        assert!(is_true_leaf(&output(2), &header, 10, none, 0));
+        assert!(!is_true_leaf(&output(3), &header, 10, none, 0));
+
+        // A spend of the last transaction's output, in another block: its
+        // origin at the true position, then at the phantom one.
+        let spender = tiny_tx(9, Some(ids[2]));
+        let spending = header_over(&[&txs[0], &spender]);
+        let spender_branch = crate::block::merkle_branch(&[txs[0].txid().0, spender.txid().0], 1);
+        let origin_block = header.hash();
+        let origin_header = |b: &BlockHash| (*b == origin_block).then_some((5, header));
+        let spent = |origin_index| {
+            let origin = Origin {
+                block: origin_block,
+                tx_index: origin_index,
+                tx: txs[2].clone(),
+                branch: branch.clone(),
+            };
+            proved(
+                LeafKind::Spent,
+                1,
+                &spender,
+                spender_branch.clone(),
+                Some(origin),
+            )
+        };
+        assert!(is_true_leaf(&spent(2), &spending, 10, origin_header, 0));
+        assert!(!is_true_leaf(&spent(3), &spending, 10, origin_header, 0));
+    }
 
     fn leaf(key: u8, tx: u32, kind: LeafKind) -> Leaf {
         Leaf {
