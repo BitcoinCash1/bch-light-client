@@ -28,3 +28,12 @@ documentation for what peers can and cannot learn.
 transaction keys; until the nodes serve them, such lookups work for
 transactions in the mempool and in histories the wallet asked for.
 `daemon.passthrough` is not available: there is no node RPC behind the bridge.
+
+`mempool.get_fee_histogram` reads the bridge's copy of the mempool, which
+holds what peers relay. A transaction counts only when the value of every
+input it spends is known: outputs of other mempool transactions, of the last
+24 blocks, or of the scripts wallets asked for. With no UTXO set behind it,
+the bridge knows no fee for the rest, so the histogram leaves out mostly
+transactions that spend older coins. `blockchain.estimatefee` takes the
+median of those fee rates and of the last 24 blocks' known ones, and never
+less than the relay fee the peers ask.
