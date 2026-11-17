@@ -917,50 +917,13 @@ impl LightClient {
                 .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no peer connected"))?
         };
         peer.send("tx", raw.to_vec());
-        let answer = peer
-            .request(
-                "getdata",
-                encode_inv(&[Inv::tx(txid)]),
-                inner.config.request_timeout,
-                move |m| match m.command.as_str() {
-                    "tx" if sha256d(&m.payload) == txid.0 => Step::Done,
-                    "notfound" => match decode_inv(&m.payload) {
-                        Ok(items) if items.iter().any(|i| i.hash == txid.0) => Step::Done,
-                        _ => Step::Skip,
-                    },
-                    "reject" => match decode_reject(&m.payload) {
-                        Ok(r) if r.hash == Some(txid.0) => Step::Done,
-                        _ => Step::Skip,
-                    },
-                    _ => Step::Skip,
-                },
-            )
-            .await;
+        let accepted = accepted_by(&peer, txid, inner.config.request_timeout).await;
         if isolate {
             peer.close();
         }
-        let message = answer?
-            .pop()
-            .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no answer"))?;
-        match message.command.as_str() {
-            "tx" => {
-                on_mempool_tx(inner, tx);
-                Ok(txid)
-            }
-            "reject" => {
-                let reason = decode_reject(&message.payload)
-                    .map(|r| r.reason)
-                    .unwrap_or_default();
-                Err(Error::new(
-                    ErrorKind::Rejected,
-                    format!("the transaction was rejected: {reason}"),
-                ))
-            }
-            _ => Err(Error::new(
-                ErrorKind::Rejected,
-                "the peer did not accept the transaction",
-            )),
-        }
+        accepted?;
+        on_mempool_tx(inner, tx);
+        Ok(txid)
     }
 
     // ---- fees and mempool
@@ -1035,6 +998,64 @@ impl Inner {
 
     fn emit(&self, event: Event) {
         let _ = self.events.send(event);
+    }
+}
+
+/// How long a broadcast waits for the peer to take the transaction in.
+const BROADCAST_WINDOW: Duration = Duration::from_secs(20);
+
+/// Waits until `peer`, which was just sent `txid`, has it in its mempool:
+/// it is asked for the transaction until it gives it. A node may check a
+/// transaction after it answers the next message (kth admits transactions
+/// in a task of its own), so `notfound` is asked again, more slowly each
+/// time, until a reject or the end of the window.
+async fn accepted_by(peer: &Peer, txid: Txid, timeout: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout.min(BROADCAST_WINDOW);
+    let mut pause = Duration::from_millis(50);
+    loop {
+        let answer = peer
+            .request(
+                "getdata",
+                encode_inv(&[Inv::tx(txid)]),
+                timeout,
+                move |m| match m.command.as_str() {
+                    "tx" if sha256d(&m.payload) == txid.0 => Step::Done,
+                    "notfound" => match decode_inv(&m.payload) {
+                        Ok(items) if items.iter().any(|i| i.hash == txid.0) => Step::Done,
+                        _ => Step::Skip,
+                    },
+                    "reject" => match decode_reject(&m.payload) {
+                        Ok(r) if r.hash == Some(txid.0) => Step::Done,
+                        _ => Step::Skip,
+                    },
+                    _ => Step::Skip,
+                },
+            )
+            .await?
+            .pop()
+            .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no answer"))?;
+        match answer.command.as_str() {
+            "tx" => return Ok(()),
+            "reject" => {
+                let reason = decode_reject(&answer.payload)
+                    .map(|r| r.reason)
+                    .unwrap_or_default();
+                return Err(Error::new(
+                    ErrorKind::Rejected,
+                    format!("the transaction was rejected: {reason}"),
+                ));
+            }
+            _ if tokio::time::Instant::now() + pause < deadline => {
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(Duration::from_secs(2));
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Rejected,
+                    "the peer did not accept the transaction",
+                ))
+            }
+        }
     }
 }
 
@@ -1813,5 +1834,93 @@ async fn catch_up(inner: &Arc<Inner>) -> Result<()> {
         for target in changed {
             inner.emit(Event::TargetChanged { target });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::WriteExt;
+    use crate::p2p::message::{encode_message, encode_version, read_message};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    const MAGIC: [u8; 4] = [0xfa, 0xbf, 0xb5, 0xda];
+
+    /// A node that takes a transaction in only after answering `late`
+    /// requests for it with notfound, as kth may (it admits transactions in
+    /// a task of their own), or that refuses it with a reject.
+    async fn node(listener: TcpListener, late: usize, refuse: bool) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut read, mut write) = stream.into_split();
+        let send = |command: &str, payload: &[u8]| encode_message(MAGIC, command, payload);
+        write
+            .write_all(&send("version", &encode_version("/slow/", true)))
+            .await
+            .unwrap();
+        write.write_all(&send("verack", &[])).await.unwrap();
+        let mut tx = Vec::new();
+        let mut asked = 0;
+        while let Ok(message) = read_message(&mut read, MAGIC, || {}).await {
+            let reply = match message.command.as_str() {
+                "tx" => {
+                    tx = message.payload;
+                    continue;
+                }
+                "getdata" if refuse => {
+                    let mut reject = Vec::new();
+                    reject.put_var_bytes(b"tx");
+                    reject.push(0x10);
+                    reject.put_var_bytes(b"bad-txns-inputs-missingorspent");
+                    reject.put_bytes(&sha256d(&tx));
+                    send("reject", &reject)
+                }
+                "getdata" => {
+                    asked += 1;
+                    if asked > late {
+                        send("tx", &tx)
+                    } else {
+                        send("notfound", &message.payload)
+                    }
+                }
+                _ => continue,
+            };
+            if write.write_all(&reply).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    async fn broadcast_to(late: usize, refuse: bool) -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(node(listener, late, refuse));
+        let options = PeerOptions {
+            magic: MAGIC,
+            user_agent: "/test/".into(),
+            relay: true,
+            transport: Transport::Direct,
+            isolate: false,
+            connect_timeout: Duration::from_secs(5),
+        };
+        let addr = PeerAddr {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let peer = Peer::connect(addr, &options, None).await.unwrap();
+        let tx = vec![0x42; 60];
+        peer.send("tx", tx.clone());
+        accepted_by(&peer, Txid(sha256d(&tx)), Duration::from_secs(5)).await
+    }
+
+    #[tokio::test]
+    async fn a_broadcast_waits_for_a_node_that_admits_transactions_later() {
+        broadcast_to(0, false).await.expect("taken at once");
+        broadcast_to(4, false)
+            .await
+            .expect("taken after four notfound");
+        let refused = broadcast_to(0, true).await.unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::Rejected);
+        assert!(refused.to_string().contains("missingorspent"), "{refused}");
     }
 }
