@@ -82,6 +82,7 @@ pub mod params;
 pub mod pow;
 pub mod rpa;
 pub mod scan;
+pub mod script;
 pub mod tx;
 
 pub use client::{

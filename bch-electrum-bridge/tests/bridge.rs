@@ -319,6 +319,41 @@ async fn electrum_answers_match_bchd() {
         verbose["blockhash"],
         node.rpc("getblockhash", json!([111])).await
     );
+    // Scripts as BCHN's getrawtransaction shows them, which Fulcrum passes on.
+    let pay_spk = &verbose["vout"][0]["scriptPubKey"];
+    assert_eq!(
+        pay_spk["asm"],
+        json!(format!(
+            "OP_DUP OP_HASH160 {} OP_EQUALVERIFY OP_CHECKSIG",
+            hex::encode(&p2pkh[3..23])
+        ))
+    );
+    assert_eq!(pay_spk["type"], json!("pubkeyhash"));
+    assert_eq!(pay_spk["reqSigs"], json!(1));
+    let plain = Address::from_script(&p2pkh, false).unwrap();
+    assert_eq!(
+        pay_spk["addresses"],
+        json!([plain.encode("bchreg").unwrap()])
+    );
+    // The redeem script OP_1, pushed as the byte 0x51: the number 81.
+    assert_eq!(verbose["vin"][0]["scriptSig"]["asm"], json!("81"));
+    // A token output's address is token-unaware, as BCHN writes it.
+    let mint_verbose = w
+        .call(
+            "blockchain.transaction.get",
+            json!([txid_of(&mint).to_hex(), true]),
+        )
+        .await;
+    let holder_spk = &mint_verbose["vout"][0]["scriptPubKey"];
+    assert_eq!(holder_spk["type"], json!("scripthash"));
+    assert_eq!(
+        holder_spk["addresses"],
+        json!([Address::from_script(&holder, false)
+            .unwrap()
+            .encode("bchreg")
+            .unwrap()])
+    );
+    assert!(mint_verbose["vout"][0]["tokenData"].is_object());
     assert_eq!(
         w.call(
             "blockchain.transaction.get_height",
@@ -405,6 +440,15 @@ async fn electrum_answers_match_bchd() {
         .as_array()
         .unwrap()
         .contains(&sent));
+    // Its signature shows its hash type, as BCHN decodes it.
+    let signed = w
+        .call("blockchain.transaction.get", json!([sent, true]))
+        .await;
+    let asm = signed["vin"][0]["scriptSig"]["asm"].as_str().unwrap();
+    assert!(
+        asm.ends_with(&format!("[ALL|FORKID] {}", hex::encode(&key.pubkey))),
+        "{asm}"
+    );
     let bad = w
         .reply(
             "blockchain.transaction.broadcast",

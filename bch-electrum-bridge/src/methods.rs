@@ -3,6 +3,7 @@
 use crate::session::{RpcError, ScriptSub, Session};
 use bch_light_client::block::BlockHeader;
 use bch_light_client::cashaddr::Address;
+use bch_light_client::script;
 use bch_light_client::{
     BlockHash, DsProofInfo, ErrorKind, History, LightClient, OutPoint, Prefix, Target, TokenData,
     TokenFilter, Transaction, Txid,
@@ -182,14 +183,24 @@ pub async fn tx_status(client: &LightClient, txid: Txid) -> Value {
     }
 }
 
-fn script_type(script: &[u8]) -> &'static str {
-    match script {
-        [0x76, 0xa9, 0x14, .., 0x88, 0xac] if script.len() == 25 => "pubkeyhash",
-        [0xa9, 0x14, .., 0x87] if script.len() == 23 => "scripthash",
-        [0xaa, 0x20, .., 0x87] if script.len() == 35 => "scripthash32",
-        [0x6a, ..] => "nulldata",
-        _ => "nonstandard",
+/// A locking script as BCHN's getrawtransaction shows it, which Fulcrum
+/// passes on: asm, hex, type, and the required signatures and addresses of
+/// the types that have them (token-unaware addresses, as BCHN writes them).
+fn script_pubkey_json(script: &[u8], prefix: &str) -> Value {
+    let solution = script::solve(script);
+    let mut spk = json!({
+        "asm": script::to_asm(script, false),
+        "hex": hex::encode(script),
+        "type": solution.kind.as_str(),
+    });
+    if let Some((required, addresses)) = solution.destinations {
+        spk["reqSigs"] = json!(required);
+        spk["addresses"] = json!(addresses
+            .iter()
+            .filter_map(|a| a.encode(prefix).ok())
+            .collect::<Vec<_>>());
     }
+    spk
 }
 
 fn verbose_tx(
@@ -208,7 +219,10 @@ fn verbose_tx(
                 json!({
                     "txid": i.prevout.txid.to_hex(),
                     "vout": i.prevout.vout,
-                    "scriptSig": {"asm": "", "hex": hex::encode(&i.script_sig)},
+                    "scriptSig": {
+                        "asm": script::to_asm(&i.script_sig, true),
+                        "hex": hex::encode(&i.script_sig),
+                    },
                     "sequence": i.sequence,
                 })
             }
@@ -219,13 +233,7 @@ fn verbose_tx(
         .iter()
         .enumerate()
         .map(|(n, o)| {
-            let mut spk =
-                json!({"asm": "", "hex": hex::encode(&o.script), "type": script_type(&o.script)});
-            if let Ok(address) =
-                Address::from_script(&o.script, o.token.is_some()).and_then(|a| a.encode(prefix))
-            {
-                spk["addresses"] = json!([address]);
-            }
+            let spk = script_pubkey_json(&o.script, prefix);
             let mut out = json!({"value": o.value as f64 / 1e8, "n": n, "scriptPubKey": spk});
             if let Some(token) = &o.token {
                 out["tokenData"] = token_json(token);

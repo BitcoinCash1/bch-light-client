@@ -23,6 +23,11 @@ they must also serve input prefix filters (type 2). With `--proxy`, every
 block is fetched over a Tor circuit of its own; see the library's
 documentation for what peers can and cannot learn.
 
+`blockchain.transaction.get` with `verbose` answers as BCHN's
+`getrawtransaction` does, which Fulcrum passes on: `asm`, output types,
+required signatures and addresses come from the library's own reading of the
+scripts, as BCHN 29 writes them.
+
 `blockchain.rpa.*` follows Fulcrum's limits: prefixes of 8 to 16 bits, at most
 60 blocks per call. Lookups by transaction ID alone need filters with
 transaction keys; until the nodes serve them, such lookups work for
