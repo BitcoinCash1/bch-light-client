@@ -72,3 +72,89 @@ async fn a_watched_payment_fee_is_never_looked_up() {
     );
     client.shutdown();
 }
+
+/// bchd that serves input prefix filters and relays double-spend proofs:
+/// $BCHD_RPA_BIN, or .tools/bchd-rpa(.exe).
+fn bchd_rpa_binary() -> Option<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("BCHD_RPA_BIN") {
+        return Some(path.into());
+    }
+    let exe = if cfg!(windows) {
+        "bchd-rpa.exe"
+    } else {
+        "bchd-rpa"
+    };
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(".tools")
+        .join(exe);
+    path.exists().then_some(path)
+}
+
+/// A double-spend proof of a coin the client does not hold (no watched
+/// script's, not of the last blocks) is not checked by fetching the coin's
+/// block: which proofs make the client download, and which do not, would
+/// tell a peer which coins are the wallet's. The proof waits, unchecked,
+/// and nothing is downloaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proof_of_a_coin_not_held_downloads_nothing() {
+    let found = bchd_rpa_binary();
+    if found.is_none() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "bchd with input prefix filters is missing (set BCHD_RPA_BIN)"
+        );
+        eprintln!("skipped: no bchd with input prefix filters (set BCHD_RPA_BIN)");
+        return;
+    }
+    let node = Bchd::start_with(&found.unwrap(), "privacy-proof").await;
+    node.generate(110).await;
+    let key = Key::new(41);
+    let (coinbase, value) = node.coinbase(1).await;
+    let fund = TxSpec {
+        inputs: vec![(coinbase, Unlock::Redeem(vec![0x51]))],
+        outputs: vec![(value - 3000, key.script(), vec![])],
+    }
+    .build();
+    node.send(&fund).await;
+    // The coin's block, then 30 more: the client starts after them.
+    node.generate(31).await;
+    let client = synced_client(&node, "client").await;
+    let coin = bch_light_client::OutPoint::new(txid_of(&fund), 0);
+    let spend = |to: Vec<u8>, fee: u64| {
+        TxSpec {
+            inputs: vec![(coin, Unlock::Sign(&key, value - 3000))],
+            outputs: vec![(value - 3000 - fee, to, vec![])],
+        }
+        .build()
+    };
+    let first = spend(mining_script(), 2000);
+    let second = spend(p2sh20(&[0x52, 0x75, 0x51]), 4000);
+    let first_id = Txid::from_hex(&node.send(&first).await).unwrap();
+    wait_mempool(&client, &first_id).await;
+    let before = client.stats().blocks_downloaded;
+    // bchd makes a proof when the second spend arrives over P2P.
+    assert!(client.broadcast(&second).await.is_err());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while node
+        .try_rpc("getdsproof", serde_json::json!([first_id.to_hex()]))
+        .await
+        .map_or(true, |p| p.is_null())
+    {
+        assert!(Instant::now() < deadline, "bchd made no proof");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Time for the proof to be announced, fetched, and (wrongly) checked.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        client.ds_proof(first_id.0),
+        None,
+        "checked without the coin"
+    );
+    assert_eq!(
+        client.stats().blocks_downloaded,
+        before,
+        "a block was downloaded to check the proof"
+    );
+    client.shutdown();
+}

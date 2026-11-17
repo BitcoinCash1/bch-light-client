@@ -1185,7 +1185,7 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
                 }
             }
             "headers" => inner.wake.notify_one(),
-            crate::dsproof::COMMAND => dsproofs::on_proof(&inner, message.payload),
+            crate::dsproof::COMMAND => dsproofs::on_relayed(&inner, message.payload),
             "addr" if inner.config.learn_peers => {
                 if let Ok(addrs) = crate::p2p::pool::decode_addr(&message.payload) {
                     let learned = inner.pool.learn(
@@ -1268,9 +1268,7 @@ fn on_mempool_tx(inner: &Arc<Inner>, tx: Transaction) {
         inner.emit(Event::TargetChanged { target });
     }
     dsproofs::on_descendant(inner, &tx);
-    if dsproofs::has_pending(inner) {
-        dsproofs::retry_pending(inner);
-    }
+    dsproofs::on_mempool_tx(inner, &tx);
 }
 
 async fn sync_loop(inner: Arc<Inner>) {
