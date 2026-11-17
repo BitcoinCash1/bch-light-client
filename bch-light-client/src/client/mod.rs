@@ -16,6 +16,7 @@ use crate::p2p::message::{
     decode_cfcheckpt, decode_cfheaders, decode_cfilter, decode_feefilter, decode_headers,
     decode_inv, decode_reject, encode_getcf, encode_getcfcheckpt, encode_getheaders, encode_inv,
     Inv, INV_BLOCK, INV_TX, MAX_CFHEADERS_PER_MSG, MAX_CFILTERS_PER_MSG, MAX_HEADERS_PER_MSG,
+    NODE_BLOOM,
 };
 use crate::p2p::peer::{Peer, PeerEvent, PeerOptions, Step};
 use crate::p2p::pool::Pool;
@@ -1389,8 +1390,12 @@ async fn follow_tip(inner: &Arc<Inner>) -> Result<()> {
             // Too many blocks went by to read them all: start the mempool copy over.
             *inner.mempool.write().expect("mempool lock") =
                 Mempool::new(inner.config.mempool_max_bytes);
+            // Only peers that offer bloom filters take the mempool message;
+            // BCHN and kth disconnect the others for it.
             for peer in inner.pool.peers() {
-                peer.send("mempool", Vec::new());
+                if peer.info.services & NODE_BLOOM != 0 {
+                    peer.send("mempool", Vec::new());
+                }
             }
             tip
         }
