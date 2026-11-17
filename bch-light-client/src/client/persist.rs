@@ -21,7 +21,7 @@ fn read_token(r: &mut Reader<'_>) -> Result<Option<TokenData>, crate::encode::De
         return Ok(None);
     }
     match TokenData::split(prefix) {
-        (Some(token), rest) if rest.is_empty() => Ok(Some(token)),
+        (Some(token), []) => Ok(Some(token)),
         _ => Err(crate::encode::DecodeError::Invalid("bad token prefix")),
     }
 }

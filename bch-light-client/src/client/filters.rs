@@ -656,10 +656,10 @@ async fn settle_script(
     };
     let mut want = root_a.to_vec();
     want.extend(gcs_of_leaves(&block, &leaves));
+    // Unless the first peer's filter is the one its own leaves give, it is
+    // wrong, whether or not the second peer's is right.
     Ok(if want == fa {
         Verdict::Second
-    } else if want == fb {
-        Verdict::First
     } else {
         Verdict::First
     })

@@ -25,7 +25,10 @@ async fn wait_tip(node: &Bchd, client: &LightClient) -> Duration {
         if status.synced && status.filter_height == Some(height) {
             return started.elapsed();
         }
-        assert!(started.elapsed() < Duration::from_secs(120), "client did not reach {height}: {status:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "client did not reach {height}: {status:?}"
+        );
         client.poke();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -35,7 +38,13 @@ async fn wait_tip(node: &Bchd, client: &LightClient) -> Duration {
 fn empty_block(prev: &BlockHeader, height: u32) -> Vec<u8> {
     let mut script_sig = Vec::new();
     let h = height.to_le_bytes();
-    let len = if height < 0x80 { 1 } else if height < 0x8000 { 2 } else { 3 };
+    let len = if height < 0x80 {
+        1
+    } else if height < 0x8000 {
+        2
+    } else {
+        3
+    };
     script_sig.push(len as u8);
     script_sig.extend_from_slice(&h[..len]);
     script_sig.push(40);
@@ -73,7 +82,10 @@ fn empty_block(prev: &BlockHeader, height: u32) -> Vec<u8> {
 async fn header_of(node: &Bchd, height: u32) -> BlockHeader {
     let hash = node.rpc("getblockhash", json!([height])).await;
     let hex_header = node.rpc("getblockheader", json!([hash, false])).await;
-    let raw: [u8; 80] = hex::decode(hex_header.as_str().unwrap()).unwrap().try_into().unwrap();
+    let raw: [u8; 80] = hex::decode(hex_header.as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
     BlockHeader::from_bytes(&raw)
 }
 
@@ -94,7 +106,10 @@ async fn birthday_restart_and_reorg_mempool() {
     let (cb1, v1) = node.coinbase(1).await;
     let pay = TxSpec {
         inputs: vec![(cb1, Unlock::Redeem(vec![0x51]))],
-        outputs: vec![(100_000_000, p2pkh.clone(), vec![]), (v1 - 100_000_000 - 3000, mining.clone(), vec![])],
+        outputs: vec![
+            (100_000_000, p2pkh.clone(), vec![]),
+            (v1 - 100_000_000 - 3000, mining.clone(), vec![]),
+        ],
     }
     .build();
     node.send(&pay).await;
@@ -129,14 +144,21 @@ async fn birthday_restart_and_reorg_mempool() {
     wait_tip(&node, &client).await;
     let again = client.history(&target).await.unwrap();
     assert_eq!(again.confirmed, history.confirmed);
-    assert!(client.stats().blocks_downloaded <= 1, "{:?}", client.stats());
+    assert!(
+        client.stats().blocks_downloaded <= 1,
+        "{:?}",
+        client.stats()
+    );
 
     // A payment confirmed in a block that a reorganization removes goes back
     // to the mempool copy, as bchd puts it back in its mempool.
     let (cb2, v2) = node.coinbase(2).await;
     let moved = TxSpec {
         inputs: vec![(cb2, Unlock::Redeem(vec![0x51]))],
-        outputs: vec![(70_000_000, p2pkh.clone(), vec![]), (v2 - 70_000_000 - 3000, mining.clone(), vec![])],
+        outputs: vec![
+            (70_000_000, p2pkh.clone(), vec![]),
+            (v2 - 70_000_000 - 3000, mining.clone(), vec![]),
+        ],
     }
     .build();
     let moved_id = txid_of(&moved);
@@ -144,7 +166,10 @@ async fn birthday_restart_and_reorg_mempool() {
     node.generate(1).await;
     wait_tip(&node, &client).await;
     let confirmed = client.history(&target).await.unwrap();
-    assert!(confirmed.confirmed.iter().any(|t| t.txid == moved_id && t.height == 2502));
+    assert!(confirmed
+        .confirmed
+        .iter()
+        .any(|t| t.txid == moved_id && t.height == 2502));
     let replaced = node.rpc("getblockhash", json!([2502])).await;
     node.rpc("invalidateblock", json!([replaced])).await;
     let base = header_of(&node, 2501).await;
@@ -153,17 +178,32 @@ async fn birthday_restart_and_reorg_mempool() {
     let second = empty_block(&first_header, 2503);
     node.rpc("submitblock", json!([hex::encode(&first)])).await;
     node.rpc("submitblock", json!([hex::encode(&second)])).await;
-    assert_eq!(BlockHash::from_hex(node.rpc("getbestblockhash", json!([])).await.as_str().unwrap()).unwrap(), BlockHeader::from_bytes(&second[..80].try_into().unwrap()).hash());
+    assert_eq!(
+        BlockHash::from_hex(
+            node.rpc("getbestblockhash", json!([]))
+                .await
+                .as_str()
+                .unwrap()
+        )
+        .unwrap(),
+        BlockHeader::from_bytes(&second[..80].try_into().unwrap()).hash()
+    );
     wait_tip(&node, &client).await;
     let deadline = Instant::now() + Duration::from_secs(30);
     while !client.in_mempool(&moved_id) {
-        assert!(Instant::now() < deadline, "the reorganized payment is not back in the mempool copy");
+        assert!(
+            Instant::now() < deadline,
+            "the reorganized payment is not back in the mempool copy"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let after = client.history(&target).await.unwrap();
     assert!(after.confirmed.iter().all(|t| t.txid != moved_id));
     assert!(after.mempool.iter().any(|e| e.txid == moved_id));
     let balance = client.balance(&target, TokenFilter::Include).await.unwrap();
-    assert_eq!((balance.confirmed, balance.unconfirmed), (100_000_000, 70_000_000));
+    assert_eq!(
+        (balance.confirmed, balance.unconfirmed),
+        (100_000_000, 70_000_000)
+    );
     client.shutdown();
 }

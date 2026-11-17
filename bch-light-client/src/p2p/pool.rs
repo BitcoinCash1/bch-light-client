@@ -234,8 +234,8 @@ impl Pool {
             });
             options
                 .into_iter()
-                .map(|k| k.clone())
                 .find(|k| !self.is_banned(&k.addr))
+                .cloned()
         };
         let Some(candidate) = candidate else { return };
         let addr = candidate.addr.clone();
