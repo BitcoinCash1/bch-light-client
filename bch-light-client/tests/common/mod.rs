@@ -125,6 +125,11 @@ impl Bchd {
 
     /// Starts the given bchd binary.
     pub async fn start_with(bin: &Path, name: &str) -> Bchd {
+        Self::start_args(bin, name, &[]).await
+    }
+
+    /// Starts the given bchd binary with more options.
+    pub async fn start_args(bin: &Path, name: &str, extra: &[&str]) -> Bchd {
         let dir =
             std::env::temp_dir().join(format!("bch-light-client-it-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -146,6 +151,7 @@ impl Bchd {
                 "--debuglevel={}",
                 std::env::var("BCHD_DEBUGLEVEL").unwrap_or_else(|_| "info".into())
             ))
+            .args(extra)
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()

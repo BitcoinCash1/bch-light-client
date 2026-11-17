@@ -20,7 +20,9 @@ Usage: bch-electrum-bridge --peer HOST:PORT [--peer HOST:PORT ...] [options]
 Options:
   --network NAME          mainnet, chipnet, testnet4, testnet3, regtest or simnet (default mainnet)
   --datadir DIR           where headers and filters are kept (default ./bch-bridge-data)
-  --peer HOST:PORT        a node that serves script filters (filter type 1); repeat for more
+  --peer HOST:PORT        a node; repeat for more. Those that serve script filters
+                          (filter type 1) give filters; the others relay transactions,
+                          their mempool and double-spend proofs
   --proxy HOST:PORT       a SOCKS5 proxy such as Tor; blocks then come over circuits of their own
   --isolate-blocks        fetch each block over a connection of its own even without a proxy
   --decoy-blocks N        fetch N random extra blocks with each block a scan needs

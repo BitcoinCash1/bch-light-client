@@ -30,7 +30,10 @@
 //!   filters, relay every transaction they accept, and see every new block
 //!   at the tip fetched, since the client downloads all of them. None of
 //!   that depends on what the wallet watches. They see a broadcast
-//!   transaction's origin unless it goes through a proxy.
+//!   transaction's origin unless it goes through a proxy. A configured node
+//!   that serves no filters (such as BCHN) is a service peer for headers,
+//!   blocks, relay, its mempool and double-spend proofs, and is never asked
+//!   for filters.
 //! - **Block downloads for a scan** are the one place interest shows: a peer
 //!   that serves a block a wallet needed learns that the block is one of
 //!   those the wallet's filters matched. A peer that sees the same client

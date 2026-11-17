@@ -18,9 +18,15 @@ Run it beside the wallet, on the same machine, and point the wallet at it:
         --peer node1.example:8333 --peer node2.example:8333 \
         [--proxy 127.0.0.1:9050] [--birthday HEIGHT] --listen 127.0.0.1:50001
 
-The nodes must serve script filters (filter type 1); for `blockchain.rpa.*`
-they must also serve input prefix filters (type 2). With `--proxy`, every
-block is fetched over a Tor circuit of its own; see the library's
+At least one node must serve script filters (filter type 1); for
+`blockchain.rpa.*` one must also serve input prefix filters (type 2). Every
+`--peer` is connected. A node that serves no filters, such as BCHN, is kept
+for headers, blocks, transaction relay, its mempool and double-spend proofs,
+and is never asked for filters. A node that offers no bloom filters (kth
+today) does not answer the mempool message, so the transactions already in
+its mempool when the bridge connects are missed, and kth relays no
+double-spend proofs: give a BCHN node beside it for those. With `--proxy`,
+every block is fetched over a Tor circuit of its own; see the library's
 documentation for what peers can and cannot learn.
 
 `blockchain.transaction.get` with `verbose` answers as BCHN's

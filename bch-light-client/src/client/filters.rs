@@ -173,7 +173,7 @@ async fn agreed_checkpoints(
     timeout: Duration,
 ) -> Option<Vec<[u8; 32]>> {
     let mut agreed: Option<Vec<[u8; 32]>> = None;
-    for peer in inner.pool.peers() {
+    for peer in inner.pool.filter_peers() {
         let Ok(list) = request_checkpoints(&peer, kind, stop, timeout).await else {
             continue;
         };
@@ -260,6 +260,13 @@ pub(crate) async fn sync(inner: &Arc<Inner>, kind: FilterKind) -> Result<()> {
     if first > tip {
         return Ok(());
     }
+    // Configured nodes without filters relay, but are never asked for filters.
+    if inner.pool.wait_filter_peer(timeout).await.is_none() {
+        return Err(Error::new(
+            ErrorKind::Unavailable,
+            "no peer that serves filters",
+        ));
+    }
     let generation = inner.generation.load(Ordering::SeqCst);
     let crosses = tip / CHECKPOINT_INTERVAL > first / CHECKPOINT_INTERVAL || first == base;
     let checkpoints = if crosses {
@@ -288,7 +295,7 @@ pub(crate) async fn sync(inner: &Arc<Inner>, kind: FilterKind) -> Result<()> {
     }
     let mut pending: VecDeque<JoinHandle<Result<Batch>>> = VecDeque::new();
     let mut next = first;
-    let in_flight = inner.pool.peers().len().max(1) * 2;
+    let in_flight = inner.pool.filter_peers().len().max(1) * 2;
     let started = std::time::Instant::now();
     loop {
         while pending.len() < in_flight && next <= tip {
@@ -301,8 +308,8 @@ pub(crate) async fn sync(inner: &Arc<Inner>, kind: FilterKind) -> Result<()> {
             };
             let peer = inner
                 .pool
-                .next_peer()
-                .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no peer connected"))?;
+                .next_filter_peer()
+                .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no peer that serves filters"))?;
             pending.push_back(tokio::spawn(fetch_batch(peer, kind, next, hashes, timeout)));
             next = end + 1;
         }
@@ -405,7 +412,7 @@ async fn cross_check(
 ) -> Result<()> {
     let Some(other) = inner
         .pool
-        .peers()
+        .filter_peers()
         .into_iter()
         .find(|p| p.id != batch.peer.id)
     else {

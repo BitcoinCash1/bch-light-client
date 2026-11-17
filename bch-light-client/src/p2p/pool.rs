@@ -3,9 +3,12 @@
 //! for one block download each when block downloads are isolated.
 //!
 //! Addresses come from the configuration, from the network's DNS seeds and
-//! from the addresses connected peers announce. Service connections go only
-//! to nodes that serve committed filters; block downloads may go to any.
-//! A peer caught serving wrong data is banned for a day.
+//! from the addresses connected peers announce. Learned addresses are kept
+//! only when the node serves committed filters, until `want` such
+//! connections are up. Every configured node is connected: one that serves
+//! no filters is kept for headers, blocks, transaction relay, its mempool
+//! and double-spend proofs, and is never asked for filters. Block downloads
+//! may go to any node. A peer caught serving wrong data is banned for a day.
 
 use super::message::{NODE_BLOOM, NODE_CF_BCH, NODE_COMPACT_FILTERS};
 use super::peer::{Peer, PeerError, PeerEvent, PeerOptions};
@@ -37,7 +40,8 @@ struct Known {
 const MAX_KNOWN: usize = 2000;
 const BAN: Duration = Duration::from_secs(24 * 3600);
 
-fn serves_filters(services: u64) -> bool {
+/// Whether a node's service bits say it serves committed filters.
+pub fn serves_filters(services: u64) -> bool {
     services & (NODE_CF_BCH | NODE_COMPACT_FILTERS) != 0
 }
 
@@ -56,6 +60,8 @@ pub struct Pool {
 }
 
 impl Pool {
+    /// A pool of the configured `addrs`, which keeps `want` connections to
+    /// nodes that serve filters and learns more addresses when `learn`.
     pub fn new(
         addrs: Vec<PeerAddr>,
         options: PeerOptions,
@@ -63,14 +69,16 @@ impl Pool {
         learn: bool,
     ) -> (Arc<Pool>, mpsc::Receiver<PeerEvent>) {
         let (events, rx) = mpsc::channel(4096);
-        let known = addrs
-            .into_iter()
-            .map(|addr| Known {
-                addr,
-                services: None,
-                source: Source::Config,
-            })
-            .collect();
+        let mut known: Vec<Known> = Vec::new();
+        for addr in addrs {
+            if !known.iter().any(|k| k.addr == addr) {
+                known.push(Known {
+                    addr,
+                    services: None,
+                    source: Source::Config,
+                });
+            }
+        }
         let pool = Pool {
             known: RwLock::new(known),
             options,
@@ -200,21 +208,17 @@ impl Pool {
     }
 
     async fn maintain(&self) {
-        let connected: Vec<PeerAddr> = {
+        let (connected, filter_peers): (Vec<PeerAddr>, usize) = {
             let mut service = self.service.write().expect("pool lock");
             service.retain(|p| p.is_alive());
-            service.iter().map(|p| p.addr.clone()).collect()
+            (
+                service.iter().map(|p| p.addr.clone()).collect(),
+                service
+                    .iter()
+                    .filter(|p| serves_filters(p.info.services))
+                    .count(),
+            )
         };
-        let usable = self
-            .known
-            .read()
-            .expect("pool lock")
-            .iter()
-            .filter(|k| k.source == Source::Config || k.services.map_or(true, serves_filters))
-            .count();
-        if connected.len() >= self.want.min(usable) {
-            return;
-        }
         let now = Instant::now();
         let candidate = {
             let retry = self.retry_at.lock().expect("retry lock");
@@ -223,6 +227,8 @@ impl Pool {
                 .iter()
                 .filter(|k| !connected.contains(&k.addr))
                 .filter(|k| k.source == Source::Config || k.services.map_or(true, serves_filters))
+                // Every configured node; learned ones until enough serve filters.
+                .filter(|k| k.source == Source::Config || filter_peers < self.want)
                 .filter(|k| !matches!(retry.get(&k.addr), Some((at, _)) if *at > now))
                 .collect();
             // Configured peers first, then those known to serve filters.
@@ -242,12 +248,19 @@ impl Pool {
         match Peer::connect(addr.clone(), &self.options, Some(self.events.clone())).await {
             Ok(peer) => {
                 self.learn([(addr.clone(), Some(peer.info.services))], candidate.source);
-                if candidate.source != Source::Config && !serves_filters(peer.info.services) {
+                let filters = serves_filters(peer.info.services);
+                if candidate.source != Source::Config && !filters {
                     debug!(peer = %addr, "no committed filters; kept for block downloads only");
                     peer.close();
                     return;
                 }
-                info!(peer = %addr, agent = %peer.info.user_agent, height = peer.info.start_height, "connected");
+                info!(
+                    peer = %addr,
+                    agent = %peer.info.user_agent,
+                    height = peer.info.start_height,
+                    filters,
+                    "connected"
+                );
                 // Every transaction the peer has, not those of interest: the mempool message.
                 if self.options.relay && peer.info.services & NODE_BLOOM != 0 {
                     peer.send("mempool", Vec::new());
@@ -284,9 +297,18 @@ impl Pool {
             .collect()
     }
 
-    /// The next service connection, in turn.
-    pub fn next_peer(&self) -> Option<Arc<Peer>> {
-        let peers = self.peers();
+    /// The live service connections to nodes that serve committed filters.
+    pub fn filter_peers(&self) -> Vec<Arc<Peer>> {
+        self.service
+            .read()
+            .expect("pool lock")
+            .iter()
+            .filter(|p| p.is_alive() && serves_filters(p.info.services))
+            .cloned()
+            .collect()
+    }
+
+    fn take_turn(&self, peers: Vec<Arc<Peer>>) -> Option<Arc<Peer>> {
         if peers.is_empty() {
             return None;
         }
@@ -294,18 +316,41 @@ impl Pool {
         Some(peers[i % peers.len()].clone())
     }
 
-    /// Waits up to `timeout` for a service connection.
-    pub async fn wait_peer(&self, timeout: Duration) -> Option<Arc<Peer>> {
+    /// The next service connection, in turn.
+    pub fn next_peer(&self) -> Option<Arc<Peer>> {
+        self.take_turn(self.peers())
+    }
+
+    /// The next service connection that serves filters, in turn.
+    pub fn next_filter_peer(&self) -> Option<Arc<Peer>> {
+        self.take_turn(self.filter_peers())
+    }
+
+    async fn wait_for(
+        &self,
+        timeout: Duration,
+        pick: impl Fn(&Self) -> Option<Arc<Peer>>,
+    ) -> Option<Arc<Peer>> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.connected.notified();
-            if let Some(peer) = self.next_peer() {
+            if let Some(peer) = pick(self) {
                 return Some(peer);
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return self.next_peer();
+                return pick(self);
             }
         }
+    }
+
+    /// Waits up to `timeout` for a service connection.
+    pub async fn wait_peer(&self, timeout: Duration) -> Option<Arc<Peer>> {
+        self.wait_for(timeout, Self::next_peer).await
+    }
+
+    /// Waits up to `timeout` for a service connection that serves filters.
+    pub async fn wait_filter_peer(&self, timeout: Duration) -> Option<Arc<Peer>> {
+        self.wait_for(timeout, Self::next_filter_peer).await
     }
 
     /// A new connection of its own, to the next known peer in turn (any
