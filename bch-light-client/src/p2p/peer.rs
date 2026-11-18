@@ -54,6 +54,9 @@ enum Command {
         payload: Vec<u8>,
         collect: Collector,
         timeout: Duration,
+        /// A question the peer may not answer: the timeout counts from the
+        /// request alone, and the connection stays when it runs out.
+        probe: bool,
         reply: oneshot::Sender<Result<Vec<RawMessage>, PeerError>>,
     },
 }
@@ -211,13 +214,41 @@ impl Peer {
         timeout: Duration,
         collect: impl FnMut(&RawMessage) -> Step + Send + 'static,
     ) -> Result<Vec<RawMessage>, PeerError> {
+        self.ask(command, payload, timeout, false, Box::new(collect))
+            .await
+    }
+
+    /// Asks something the peer may leave unanswered, such as a filter type
+    /// it does not serve: no answer within `timeout` is a timeout error, and
+    /// the connection stays up. A late answer is skipped by later requests,
+    /// whose collectors take only their own answers.
+    pub async fn probe(
+        &self,
+        command: &'static str,
+        payload: Vec<u8>,
+        timeout: Duration,
+        collect: impl FnMut(&RawMessage) -> Step + Send + 'static,
+    ) -> Result<Vec<RawMessage>, PeerError> {
+        self.ask(command, payload, timeout, true, Box::new(collect))
+            .await
+    }
+
+    async fn ask(
+        &self,
+        command: &'static str,
+        payload: Vec<u8>,
+        timeout: Duration,
+        probe: bool,
+        collect: Collector,
+    ) -> Result<Vec<RawMessage>, PeerError> {
         let (reply, answer) = oneshot::channel();
         self.commands
             .send(Command::Request {
                 command,
                 payload,
-                collect: Box::new(collect),
+                collect,
                 timeout,
+                probe,
                 reply,
             })
             .await
@@ -236,6 +267,7 @@ struct Active {
     command: &'static str,
     collect: Collector,
     timeout: Duration,
+    probe: bool,
     reply: oneshot::Sender<Result<Vec<RawMessage>, PeerError>>,
     taken: Vec<RawMessage>,
     deadline: tokio::time::Instant,
@@ -280,18 +312,24 @@ impl Actor {
                     }
                 }
                 _ = sleep_until(deadline) => {
-                    let active = self.current.as_mut().expect("a deadline means a request");
+                    let active = self.current.as_ref().expect("a deadline means a request");
                     let idle_since = Duration::from_millis(self.activity.load(Ordering::Relaxed));
-                    let now = self.start.elapsed();
-                    if now.saturating_sub(idle_since) < active.timeout {
-                        active.deadline = tokio::time::Instant::now() + active.timeout - now.saturating_sub(idle_since);
+                    let idle = self.start.elapsed().saturating_sub(idle_since);
+                    // A request's timeout restarts with every byte that
+                    // arrives; a probe's counts from the request alone.
+                    if !active.probe && idle < active.timeout {
+                        let wait = active.timeout - idle;
+                        self.current.as_mut().expect("checked above").deadline =
+                            tokio::time::Instant::now() + wait;
                         continue;
                     }
                     let active = self.current.take().expect("checked above");
                     let what = format!("{} request", active.command);
                     let _ = active.reply.send(Err(PeerError::Timeout(what.clone())));
-                    // A late answer could be taken for the next request's.
-                    break format!("{what} timed out");
+                    if !active.probe {
+                        // A late answer could be taken for the next request's.
+                        break format!("{what} timed out");
+                    }
                 }
             }
             if let Err(e) = self.pump().await {
@@ -334,6 +372,7 @@ impl Actor {
                         payload,
                         collect,
                         timeout,
+                        probe,
                         reply,
                     }) = self.queue.pop_front()
                     else {
@@ -349,6 +388,7 @@ impl Actor {
                         command,
                         collect,
                         timeout,
+                        probe,
                         reply,
                         taken: Vec::new(),
                         deadline: tokio::time::Instant::now() + timeout,

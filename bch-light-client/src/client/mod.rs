@@ -324,6 +324,8 @@ struct Inner {
     stats: Counters,
     dsproofs: Mutex<dsproofs::DsProofs>,
     served: Mutex<filters::Served>,
+    /// Which filter types (script, input prefix) each connection serves, once asked.
+    filter_types: Mutex<HashMap<u64, [Option<bool>; 2]>>,
     /// The network's data folder.
     dir: PathBuf,
     generation: AtomicU64,
@@ -446,6 +448,7 @@ impl LightClient {
             stats: Counters::default(),
             dsproofs: Mutex::new(dsproofs::DsProofs::default()),
             served: Mutex::new(filters::Served::default()),
+            filter_types: Mutex::new(HashMap::new()),
             dir: dir.clone(),
             generation: AtomicU64::new(0),
             targets: Mutex::new(watched),

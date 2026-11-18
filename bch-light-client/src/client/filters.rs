@@ -200,14 +200,14 @@ async fn request_checkpoints(
 /// Checkpoints all answering peers agree on, or None when they disagree
 /// (the per-batch check against a second peer then finds where).
 async fn agreed_checkpoints(
-    inner: &Arc<Inner>,
+    peers: &[Arc<Peer>],
     kind: FilterKind,
     stop: BlockHash,
     timeout: Duration,
 ) -> Option<Vec<[u8; 32]>> {
     let mut agreed: Option<Vec<[u8; 32]>> = None;
-    for peer in inner.pool.filter_peers() {
-        let Ok(list) = request_checkpoints(&peer, kind, stop, timeout).await else {
+    for peer in peers {
+        let Ok(list) = request_checkpoints(peer, kind, stop, timeout).await else {
             continue;
         };
         match &agreed {
@@ -225,6 +225,73 @@ async fn agreed_checkpoints(
         }
     }
     agreed
+}
+
+/// How long a peer may take to show that it serves a filter type.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether a peer serves filters of `kind`. It is asked once per connection
+/// with getcfcheckpt, for a block it had when it connected: a node may
+/// leave a filter type it lacks unanswered, so no answer in time means no,
+/// and the connection stays.
+async fn serves(inner: &Inner, peer: &Peer, kind: FilterKind) -> bool {
+    if let Some(known) = inner
+        .filter_types
+        .lock()
+        .expect("filter types lock")
+        .get(&peer.id)
+        .and_then(|t| t[kind.index()])
+    {
+        return known;
+    }
+    let stop = {
+        let chain = inner.chain.read().expect("chain lock");
+        let height = u32::try_from(peer.info.start_height)
+            .unwrap_or(0)
+            .min(chain.tip_height());
+        chain.hash_at(height).expect("at most the tip")
+    };
+    let filter_type = kind.filter_type();
+    let answered = peer
+        .probe(
+            "getcfcheckpt",
+            encode_getcfcheckpt(filter_type, stop),
+            inner.config.request_timeout.min(PROBE_TIMEOUT),
+            move |m| match decode_cfcheckpt(&m.payload) {
+                Ok(c) if m.command == "cfcheckpt" && c.filter_type == filter_type => Step::Done,
+                _ => Step::Skip,
+            },
+        )
+        .await
+        .is_ok();
+    if !answered {
+        info!(peer = %peer.addr, kind = kind.name(), "does not serve these filters");
+    }
+    inner
+        .filter_types
+        .lock()
+        .expect("filter types lock")
+        .entry(peer.id)
+        .or_default()[kind.index()] = Some(answered);
+    answered
+}
+
+/// The connections to nodes that serve filters of `kind`, asking those not
+/// asked yet.
+pub(crate) async fn peers_for(inner: &Inner, kind: FilterKind) -> Vec<Arc<Peer>> {
+    let peers = inner.pool.filter_peers();
+    inner
+        .filter_types
+        .lock()
+        .expect("filter types lock")
+        .retain(|id, _| peers.iter().any(|p| p.id == *id));
+    let mut out = Vec::with_capacity(peers.len());
+    for peer in peers {
+        if serves(inner, &peer, kind).await {
+            out.push(peer);
+        }
+    }
+    out
 }
 
 struct Batch {
@@ -277,11 +344,7 @@ pub(crate) async fn sync(inner: &Arc<Inner>, kind: FilterKind) -> Result<()> {
     let Some(store_lock) = inner.store(kind) else {
         return Ok(());
     };
-    let timeout = match kind {
-        FilterKind::Script => inner.config.request_timeout,
-        // Nodes that do not serve type 2 never answer; do not stall on them.
-        FilterKind::Rpa => inner.config.request_timeout.min(Duration::from_secs(15)),
-    };
+    let timeout = inner.config.request_timeout;
     let (tip, tip_hash) = {
         let chain = inner.chain.read().expect("chain lock");
         (chain.tip_height(), chain.tip_hash())
@@ -293,17 +356,21 @@ pub(crate) async fn sync(inner: &Arc<Inner>, kind: FilterKind) -> Result<()> {
     if first > tip {
         return Ok(());
     }
-    // Configured nodes without filters relay, but are never asked for filters.
-    if inner.pool.wait_filter_peer(timeout).await.is_none() {
+    // Configured nodes without filters relay, but are never asked for
+    // filters; nodes that serve filters are asked only for the types they
+    // serve.
+    inner.pool.wait_filter_peer(timeout).await;
+    let peers = peers_for(inner, kind).await;
+    if peers.is_empty() {
         return Err(Error::new(
             ErrorKind::Unavailable,
-            "no peer that serves filters",
+            format!("no peer that serves {}", kind.name()),
         ));
     }
     let generation = inner.generation.load(Ordering::SeqCst);
     let crosses = tip / CHECKPOINT_INTERVAL > first / CHECKPOINT_INTERVAL || first == base;
     let checkpoints = if crosses {
-        agreed_checkpoints(inner, kind, tip_hash, timeout).await
+        agreed_checkpoints(&peers, kind, tip_hash, timeout).await
     } else {
         None
     };
@@ -326,9 +393,11 @@ pub(crate) async fn sync(inner: &Arc<Inner>, kind: FilterKind) -> Result<()> {
             .set_anchor(anchor)
             .map_err(|e| storage_error("filters", e))?;
     }
-    let mut pending: VecDeque<JoinHandle<Result<Batch>>> = VecDeque::new();
+    type Pending = (u64, u32, Vec<BlockHash>, JoinHandle<Result<Batch>>);
+    let mut pending: VecDeque<Pending> = VecDeque::new();
     let mut next = first;
-    let in_flight = inner.pool.filter_peers().len().max(1) * 2;
+    let in_flight = peers.len() * 2;
+    let mut turn = rand::thread_rng().gen_range(0..peers.len());
     let started = std::time::Instant::now();
     loop {
         while pending.len() < in_flight && next <= tip {
@@ -339,23 +408,32 @@ pub(crate) async fn sync(inner: &Arc<Inner>, kind: FilterKind) -> Result<()> {
                     .map(|h| chain.hash_at(h).expect("below tip"))
                     .collect()
             };
-            let peer = inner
-                .pool
-                .next_filter_peer()
-                .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no peer that serves filters"))?;
-            pending.push_back(tokio::spawn(fetch_batch(peer, kind, next, hashes, timeout)));
+            let peer = peers[turn % peers.len()].clone();
+            turn += 1;
+            let task = tokio::spawn(fetch_batch(
+                peer.clone(),
+                kind,
+                next,
+                hashes.clone(),
+                timeout,
+            ));
+            pending.push_back((peer.id, next, hashes, task));
             next = end + 1;
         }
-        let Some(task) = pending.pop_front() else {
+        let Some((asked, start, hashes, task)) = pending.pop_front() else {
             break;
         };
-        let batch = task
+        let fetched = task
             .await
-            .map_err(|e| Error::new(ErrorKind::Stopped, e.to_string()))??;
+            .map_err(|e| Error::new(ErrorKind::Stopped, e.to_string()))?;
+        let batch = match fetched {
+            Ok(batch) => batch,
+            Err(e) => refetch(inner, kind, &peers, asked, start, hashes, e, timeout).await?,
+        };
         if inner.generation.load(Ordering::SeqCst) != generation {
             return Ok(());
         }
-        cross_check(inner, kind, &batch, timeout).await?;
+        cross_check(inner, kind, &batch, &peers, timeout).await?;
         if kind == FilterKind::Rpa {
             if let Some(i) = batch.filters.iter().position(|f| rpa::decode(f).is_err()) {
                 inner
@@ -446,13 +524,13 @@ async fn cross_check(
     inner: &Arc<Inner>,
     kind: FilterKind,
     batch: &Batch,
+    peers: &[Arc<Peer>],
     timeout: Duration,
 ) -> Result<()> {
-    let others: Vec<Arc<Peer>> = inner
-        .pool
-        .filter_peers()
-        .into_iter()
-        .filter(|p| p.id != batch.peer.id)
+    let others: Vec<Arc<Peer>> = peers
+        .iter()
+        .filter(|p| p.id != batch.peer.id && p.is_alive())
+        .cloned()
         .collect();
     if others.is_empty() {
         return Ok(());
@@ -540,6 +618,45 @@ async fn cross_check(
             kind.name()
         ),
     ))
+}
+
+/// A batch whose peer failed it, asked of the other peers in turn. A peer
+/// that served something wrong (not a timeout or a closed connection) is
+/// banned.
+#[allow(clippy::too_many_arguments)]
+async fn refetch(
+    inner: &Arc<Inner>,
+    kind: FilterKind,
+    peers: &[Arc<Peer>],
+    failed: u64,
+    start: u32,
+    hashes: Vec<BlockHash>,
+    error: Error,
+    timeout: Duration,
+) -> Result<Batch> {
+    if let Some(peer) = peers.iter().find(|p| p.id == failed) {
+        if error.kind() == ErrorKind::InvalidData {
+            inner
+                .pool
+                .ban(&peer.addr, "served wrong filter headers or filters");
+        }
+        warn!(kind = kind.name(), start, peer = %peer.addr, error = %error, "a batch failed; asking another peer");
+    }
+    let mut last = error;
+    for peer in peers.iter().filter(|p| p.id != failed && p.is_alive()) {
+        match fetch_batch(peer.clone(), kind, start, hashes.clone(), timeout).await {
+            Ok(batch) => return Ok(batch),
+            Err(e) => {
+                if e.kind() == ErrorKind::InvalidData {
+                    inner
+                        .pool
+                        .ban(&peer.addr, "served wrong filter headers or filters");
+                }
+                last = e;
+            }
+        }
+    }
+    Err(last)
 }
 
 /// The lowest stored height whose filter header `peer` gives differently.

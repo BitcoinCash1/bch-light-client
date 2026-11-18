@@ -286,3 +286,64 @@ async fn a_wrong_script_filter_is_dropped_with_its_peer() {
     }
     client.shutdown();
 }
+
+/// Two nodes that both say they serve committed filters, one with input
+/// prefix filters (type 2) and one without, on the same chain. Batches of
+/// type 2 went to both in turn: each one asked of the node without them
+/// went unanswered, timed out, failed the round and closed the connection.
+/// Now each node is asked once which filter types it serves, batches go
+/// only to those that do, and the connection stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_prefix_filters_come_only_from_nodes_that_serve_them() {
+    let (Some(with), Some(without)) = (bchd_rpa_or_skip(), bchd_txid_binary_or_skip()) else {
+        return;
+    };
+    let rpa = Bchd::start_with(&with, "types-rpa").await;
+    let plain = Bchd::start_with(&without, "types-plain").await;
+    plain
+        .rpc("addnode", serde_json::json!([rpa.peer(), "add"]))
+        .await;
+    rpa.generate(110).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while plain.height().await < 110 {
+        assert!(Instant::now() < deadline, "the nodes did not connect");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    init_tracing();
+    let mut config = Config::new(
+        Network::Regtest,
+        rpa.dir.join("client"),
+        vec![plain.peer(), rpa.peer()],
+    );
+    config.request_timeout = Duration::from_secs(10);
+    config.learn_peers = false;
+    config.rpa_filters = true;
+    let client = LightClient::start(config).await.expect("start client");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while client.status().peers < 2 {
+        assert!(Instant::now() < deadline, "both peers did not connect");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for round in 0..3 {
+        rpa.generate(5).await;
+        let tip = rpa.height().await;
+        let deadline = Instant::now() + Duration::from_secs(40);
+        loop {
+            let status = client.status();
+            assert_eq!(
+                status.peers, 2,
+                "round {round}: a connection closed: {status:?}"
+            );
+            if status.filter_height == Some(tip) && status.rpa_height == Some(tip) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: not at {tip}: {status:?}"
+            );
+            client.poke();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    client.shutdown();
+}
