@@ -290,6 +290,19 @@ pub struct MempoolSummary {
 
 /// The default relay fee of Bitcoin Cash nodes, satoshis per 1000 bytes.
 const DEFAULT_RELAY_FEE: u64 = 1000;
+/// The highest relay fee a peer's feefilter may make the client ask.
+const MAX_RELAY_FEE: u64 = 10 * DEFAULT_RELAY_FEE;
+
+/// The relay fee from the feefilters of the connected peers: their median,
+/// so that one peer cannot raise it alone, and at most MAX_RELAY_FEE; the
+/// default when none sent one.
+fn relay_fee(mut fees: Vec<u64>) -> u64 {
+    fees.sort_unstable();
+    fees.get(fees.len() / 2)
+        .copied()
+        .unwrap_or(DEFAULT_RELAY_FEE)
+        .clamp(1, MAX_RELAY_FEE)
+}
 const CHECKPOINT_INTERVAL: u32 = 1000;
 const LIVE_WINDOW: u32 = 12;
 const RECENT_BLOCKS: usize = 24;
@@ -977,16 +990,12 @@ impl LightClient {
     // ---- fees and mempool
 
     pub fn fee_estimate(&self) -> FeeEstimate {
-        let relay = self
-            .inner
-            .peer_fees
-            .lock()
-            .expect("fees lock")
-            .values()
-            .copied()
-            .max()
-            .unwrap_or(DEFAULT_RELAY_FEE)
-            .max(1);
+        let relay = {
+            let live: HashSet<u64> = self.inner.pool.peers().iter().map(|p| p.id).collect();
+            let mut fees = self.inner.peer_fees.lock().expect("fees lock");
+            fees.retain(|peer, _| live.contains(peer));
+            relay_fee(fees.values().copied().collect())
+        };
         let mut rates: Vec<u64> = self
             .inner
             .recent
@@ -2000,6 +2009,16 @@ mod tests {
         let tx = vec![0x42; 60];
         peer.send("tx", tx.clone());
         accepted_by(&peer, Txid(sha256d(&tx)), Duration::from_secs(5)).await
+    }
+
+    #[test]
+    fn the_relay_fee_is_the_connected_peers_median_capped() {
+        assert_eq!(relay_fee(vec![]), DEFAULT_RELAY_FEE);
+        // One peer asking a lot does not set it alone.
+        assert_eq!(relay_fee(vec![1000, 1000, 500_000]), 1000);
+        assert_eq!(relay_fee(vec![2000, 3000]), 3000);
+        assert_eq!(relay_fee(vec![900_000, 900_000]), MAX_RELAY_FEE);
+        assert_eq!(relay_fee(vec![0]), 1);
     }
 
     #[tokio::test]
