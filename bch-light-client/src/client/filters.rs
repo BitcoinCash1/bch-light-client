@@ -70,10 +70,11 @@ pub(crate) fn forget_served(inner: &Inner, kind: FilterKind, height: u32) {
 }
 
 /// The first height a store keeps for a wallet whose history starts at
-/// `birthday`: just after the checkpoint at or below it, whose filter
-/// header the peers give (BIP157 checkpoints are every 1000 blocks).
+/// `birthday`: just after the last checkpoint below it, whose filter
+/// header the peers give (BIP157 checkpoints are every 1000 blocks). The
+/// birthday's own block is kept.
 pub(crate) fn store_base(birthday: u32) -> u32 {
-    let cp = birthday / CHECKPOINT_INTERVAL * CHECKPOINT_INTERVAL;
+    let cp = birthday.saturating_sub(1) / CHECKPOINT_INTERVAL * CHECKPOINT_INTERVAL;
     if cp == 0 {
         0
     } else {
@@ -919,4 +920,30 @@ async fn all_leaves(
         leaves.extend(range.run);
     }
     (leaves.len() as u32 == count).then_some(leaves)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store keeps the birthday's own block: a birthday at a multiple of
+    /// 1000 started just after it, and the RPA start height 825,000 was
+    /// never searched.
+    #[test]
+    fn a_store_keeps_its_birthday_block() {
+        for birthday in [
+            0, 1, 999, 1000, 1001, 1999, 2000, 2001, 824_999, 825_000, 825_001,
+        ] {
+            let base = store_base(birthday);
+            assert!(base <= birthday, "{birthday} starts at {base}");
+            assert!(base == 0 || base % CHECKPOINT_INTERVAL == 1, "{base}");
+            assert!(
+                birthday - base <= CHECKPOINT_INTERVAL,
+                "{birthday} starts at {base}"
+            );
+        }
+        assert_eq!(store_base(2000), 1001);
+        assert_eq!(store_base(2001), 2001);
+        assert_eq!(store_base(825_000), 824_001);
+    }
 }
