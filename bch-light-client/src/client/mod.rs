@@ -1193,10 +1193,7 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
             crate::dsproof::COMMAND => dsproofs::on_relayed(&inner, message.payload),
             "addr" if inner.config.learn_peers => {
                 if let Ok(addrs) = crate::p2p::pool::decode_addr(&message.payload) {
-                    let learned = inner.pool.learn(
-                        addrs.into_iter().map(|(a, s)| (a, Some(s))),
-                        crate::p2p::pool::Source::Gossip,
-                    );
+                    let learned = inner.pool.learn_from(peer, addrs);
                     if learned > 0 {
                         debug!(learned, "addresses from a peer");
                     }

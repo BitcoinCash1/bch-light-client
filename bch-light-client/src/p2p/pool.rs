@@ -9,13 +9,20 @@
 //! no filters is kept for headers, blocks, transaction relay, its mempool
 //! and double-spend proofs, and is never asked for filters. Block downloads
 //! may go to any node. A peer caught serving wrong data is banned for a day.
+//!
+//! The address table is guarded against a peer that would fill it with its
+//! own nodes: addresses are taken only from peers asked for them, at most a
+//! share from each, a few per network group (an IPv4 /16, an IPv6 /32), and
+//! the services an address message claims are not believed. A full table
+//! makes room by dropping a random learned address; configured ones stay.
 
 use super::message::{NODE_BLOOM, NODE_CF_BCH, NODE_COMPACT_FILTERS};
 use super::peer::{Peer, PeerError, PeerEvent, PeerOptions};
 use super::socks::PeerAddr;
 use crate::encode::{DecodeError, Reader};
+use rand::seq::SliceRandom;
 use std::collections::HashMap;
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -38,6 +45,26 @@ struct Known {
 }
 
 const MAX_KNOWN: usize = 2000;
+/// Addresses taken from one connection's answers to getaddr.
+const MAX_PER_SOURCE: usize = 64;
+/// Learned addresses kept in one network group.
+const MAX_PER_GROUP: usize = 8;
+
+/// An address's network group: an IPv4 /16, an IPv6 /32, or a host name
+/// (such as an onion address) on its own.
+fn group(addr: &PeerAddr) -> String {
+    match addr.host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            format!("{}.{}", o[0], o[1])
+        }
+        Ok(IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}", s[0], s[1])
+        }
+        Err(_) => addr.host.clone(),
+    }
+}
 const BAN: Duration = Duration::from_secs(24 * 3600);
 
 /// Whether a node's service bits say it serves committed filters.
@@ -55,6 +82,8 @@ pub struct Pool {
     next_isolated: AtomicUsize,
     retry_at: Mutex<HashMap<PeerAddr, (Instant, Duration)>>,
     banned: Mutex<HashMap<PeerAddr, Instant>>,
+    /// Connections asked for addresses, with how many more each may add.
+    asked: Mutex<HashMap<u64, usize>>,
     events: mpsc::Sender<PeerEvent>,
     connected: Notify,
 }
@@ -89,6 +118,7 @@ impl Pool {
             next_isolated: AtomicUsize::new(rand::random::<usize>() % 1024),
             retry_at: Mutex::new(HashMap::new()),
             banned: Mutex::new(HashMap::new()),
+            asked: Mutex::new(HashMap::new()),
             events,
             connected: Notify::new(),
         };
@@ -120,6 +150,61 @@ impl Pool {
                 services,
                 source,
             });
+            added += 1;
+        }
+        added
+    }
+
+    /// Notes that a connection was sent getaddr: its answers may add up to
+    /// a share of addresses.
+    pub fn asked_for_addresses(&self, peer: u64) {
+        self.asked
+            .lock()
+            .expect("asked lock")
+            .insert(peer, MAX_PER_SOURCE);
+    }
+
+    /// Adds addresses a connection announced, when it was asked for them:
+    /// up to its share, a few per network group, and without the services
+    /// they claim. A full table makes room by dropping a random learned
+    /// address. Returns how many were added.
+    pub fn learn_from(&self, peer: u64, addrs: impl IntoIterator<Item = (PeerAddr, u64)>) -> usize {
+        let mut asked = self.asked.lock().expect("asked lock");
+        let Some(share) = asked.get_mut(&peer) else {
+            return 0;
+        };
+        let mut known = self.known.write().expect("pool lock");
+        let mut added = 0;
+        for (addr, _claimed) in addrs {
+            if *share == 0 {
+                break;
+            }
+            if known.iter().any(|k| k.addr == addr) {
+                continue;
+            }
+            let g = group(&addr);
+            let in_group = known
+                .iter()
+                .filter(|k| k.source != Source::Config && group(&k.addr) == g)
+                .count();
+            if in_group >= MAX_PER_GROUP {
+                continue;
+            }
+            if known.len() >= MAX_KNOWN {
+                let learned: Vec<usize> = (0..known.len())
+                    .filter(|&i| known[i].source != Source::Config)
+                    .collect();
+                let Some(&i) = learned.choose(&mut rand::thread_rng()) else {
+                    break;
+                };
+                known.swap_remove(i);
+            }
+            known.push(Known {
+                addr,
+                services: None,
+                source: Source::Gossip,
+            });
+            *share -= 1;
             added += 1;
         }
         added
@@ -211,6 +296,10 @@ impl Pool {
         let (connected, filter_peers): (Vec<PeerAddr>, usize) = {
             let mut service = self.service.write().expect("pool lock");
             service.retain(|p| p.is_alive());
+            self.asked
+                .lock()
+                .expect("asked lock")
+                .retain(|id, _| service.iter().any(|p| p.id == *id));
             (
                 service.iter().map(|p| p.addr.clone()).collect(),
                 service
@@ -231,13 +320,10 @@ impl Pool {
                 .filter(|k| k.source == Source::Config || filter_peers < self.want)
                 .filter(|k| !matches!(retry.get(&k.addr), Some((at, _)) if *at > now))
                 .collect();
-            // Configured peers first, then those known to serve filters.
-            options.sort_by_key(|k| {
-                (
-                    k.source != Source::Config,
-                    !k.services.is_some_and(serves_filters),
-                )
-            });
+            // Configured peers first, then the others in random order: what
+            // an address claims to serve is not believed.
+            options.shuffle(&mut rand::thread_rng());
+            options.sort_by_key(|k| k.source != Source::Config);
             options
                 .into_iter()
                 .find(|k| !self.is_banned(&k.addr))
@@ -267,6 +353,7 @@ impl Pool {
                 }
                 if self.learn {
                     peer.send("getaddr", Vec::new());
+                    self.asked_for_addresses(peer.id);
                 }
                 self.retry_at.lock().expect("retry lock").remove(&addr);
                 self.service
@@ -418,6 +505,105 @@ pub fn decode_addr(payload: &[u8]) -> Result<Vec<(PeerAddr, u64)>, DecodeError> 
 mod tests {
     use super::*;
     use crate::encode::WriteExt;
+
+    fn pool_of(config: &[&str]) -> Arc<Pool> {
+        let addrs = config
+            .iter()
+            .map(|a| PeerAddr::parse(a, 8333).unwrap())
+            .collect();
+        let options = PeerOptions {
+            magic: [0; 4],
+            user_agent: String::new(),
+            relay: false,
+            transport: super::super::socks::Transport::Direct,
+            isolate: false,
+            connect_timeout: Duration::from_secs(1),
+        };
+        Pool::new(addrs, options, 2, true).0
+    }
+
+    fn addr(a: u8, b: u8, c: u8, d: u8) -> (PeerAddr, u64) {
+        (
+            PeerAddr {
+                host: format!("{a}.{b}.{c}.{d}"),
+                port: 8333,
+            },
+            NODE_CF_BCH,
+        )
+    }
+
+    fn gossip(pool: &Pool) -> usize {
+        pool.known()
+            .iter()
+            .filter(|(_, _, s)| *s == Source::Gossip)
+            .count()
+    }
+
+    #[test]
+    fn addresses_come_only_from_peers_asked_and_within_their_share() {
+        let pool = pool_of(&["10.0.0.1:8333"]);
+        // A peer nobody asked for addresses is not heard.
+        assert_eq!(pool.learn_from(7, vec![addr(1, 2, 3, 4)]), 0);
+        // One asked gives at most its share, however many /16s it spreads over.
+        pool.asked_for_addresses(7);
+        let many: Vec<_> = (0..3000u32)
+            .map(|i| addr((i >> 8) as u8 + 1, i as u8, 0, 1))
+            .collect();
+        assert_eq!(pool.learn_from(7, many), MAX_PER_SOURCE);
+        assert_eq!(gossip(&pool), MAX_PER_SOURCE);
+        // And no more once its share is used, even across messages.
+        assert_eq!(pool.learn_from(7, vec![addr(200, 1, 1, 1)]), 0);
+    }
+
+    #[test]
+    fn one_slash_16_holds_a_few_addresses_and_claims_are_not_kept() {
+        let pool = pool_of(&[]);
+        for peer in 0..10 {
+            pool.asked_for_addresses(peer);
+            let same_group: Vec<_> = (0..50u8).map(|i| addr(66, 77, peer as u8, i)).collect();
+            pool.learn_from(peer, same_group);
+        }
+        assert_eq!(gossip(&pool), MAX_PER_GROUP);
+        // The service bits an address message claims are not taken as known.
+        assert!(pool
+            .known()
+            .iter()
+            .all(|(_, services, _)| services.is_none()));
+    }
+
+    #[test]
+    fn a_full_table_makes_room_at_random_and_keeps_configured_peers() {
+        let pool = pool_of(&["10.0.0.1:8333", "10.0.0.2:8333"]);
+        let mut peer = 0u64;
+        let mut group = 0u32;
+        while pool.known().len() < MAX_KNOWN {
+            pool.asked_for_addresses(peer);
+            let batch: Vec<_> = (0..MAX_PER_SOURCE as u32)
+                .map(|i| {
+                    let g = group + i / MAX_PER_GROUP as u32;
+                    addr((g >> 8) as u8 + 11, g as u8, 1, i as u8)
+                })
+                .collect();
+            group += (MAX_PER_SOURCE / MAX_PER_GROUP) as u32;
+            pool.learn_from(peer, batch);
+            peer += 1;
+        }
+        // Another peer's addresses still get in, in place of random others.
+        pool.asked_for_addresses(peer);
+        let newcomer = addr(250, 250, 250, 250);
+        assert_eq!(pool.learn_from(peer, vec![newcomer.clone()]), 1);
+        let known = pool.known();
+        assert_eq!(known.len(), MAX_KNOWN);
+        assert!(known.iter().any(|(a, _, _)| *a == newcomer.0));
+        assert_eq!(
+            known
+                .iter()
+                .filter(|(_, _, s)| *s == Source::Config)
+                .count(),
+            2,
+            "configured peers are never evicted"
+        );
+    }
 
     #[test]
     fn addr_messages_decode() {
