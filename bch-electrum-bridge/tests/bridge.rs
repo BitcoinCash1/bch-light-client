@@ -460,11 +460,18 @@ async fn electrum_answers_match_bchd() {
         .unwrap()
         .contains("rejected"));
 
-    // This bchd serves no input prefix filters: an RPA search finds nothing
-    // (rpa_and_dsproof_methods runs against one that does). No proof is
+    // This bchd serves no input prefix filters: an RPA search cannot be
+    // answered (rpa_and_dsproof_methods runs against one that does). No proof is
     // known for a transaction nobody double-spent. Fees from what the client sees.
-    let rpa = w.call("blockchain.rpa.get_history", json!(["ab", 0])).await;
-    assert_eq!(rpa, json!([]));
+    let rpa = w
+        .reply("blockchain.rpa.get_history", json!(["ab", 0]))
+        .await;
+    assert!(
+        rpa["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("input prefix filters")),
+        "a search of blocks without their filters is an error, not nothing found: {rpa}"
+    );
     let dsp = w
         .call("blockchain.transaction.dsproof.get", json!([sent]))
         .await;

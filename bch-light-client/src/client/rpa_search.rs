@@ -33,8 +33,10 @@ impl LightClient {
     }
 
     /// Confirmed transactions in blocks [from, to) with an input whose hash
-    /// has the prefix, in chain order. Heights without input prefix filters
-    /// (before their start height, or not synced yet) are not searched.
+    /// has the prefix, in chain order. Heights before the input prefix
+    /// filters' start height are not searched, nor heights past the chain's
+    /// tip. A range with blocks whose filters are not synced yet is an
+    /// error (Unavailable): answering nothing would say no payment is there.
     pub async fn rpa_history(&self, prefix: Prefix, from: u32, to: u32) -> Result<Vec<RpaMatch>> {
         let inner = &self.inner;
         let store_lock = inner.store(FilterKind::Rpa).ok_or_else(|| {
@@ -43,10 +45,30 @@ impl LightClient {
                 "input prefix filters are not kept (Config::rpa_filters)",
             )
         })?;
+        let chain_tip = inner.chain.read().expect("chain lock").tip_height();
+        let (base, next) = {
+            let store = store_lock.read().expect("filters lock");
+            (store.base(), store.next_height())
+        };
+        let end = to.min(chain_tip.saturating_add(1));
+        if from < end && end > next {
+            return Err(Error::new(
+                ErrorKind::Unavailable,
+                match next.checked_sub(1) {
+                    Some(last) if next > base => format!(
+                        "input prefix filters reach height {last}, not yet {}",
+                        end - 1
+                    ),
+                    _ => format!("no input prefix filters yet, from height {base}"),
+                },
+            ));
+        }
+        // Random other prefixes, as many as there are besides this one.
+        let others = (1usize << prefix.bits) - 1;
         let mut covers: Vec<Prefix> = Vec::new();
         {
             let mut rng = rand::thread_rng();
-            while covers.len() < inner.config.rpa_cover_prefixes {
+            while covers.len() < inner.config.rpa_cover_prefixes.min(others) {
                 let value = rng.gen_range(0..(1u32 << prefix.bits)) as u16;
                 let cover = Prefix {
                     value,
@@ -57,32 +79,42 @@ impl LightClient {
                 }
             }
         }
-        let filters: Vec<(u32, Vec<u8>)> = {
-            let store = store_lock.read().expect("filters lock");
-            (from.max(store.base())..to.min(store.next_height()))
-                .map(|h| store.read_checked(h).map(|f| (h, f)))
-                .collect::<std::io::Result<_>>()
-                .map_err(|e| storage_error("input prefix filters", e))?
-        };
+        // Read and matched off the async threads, a thousand filters at a
+        // time under the store's lock.
+        let scan = inner.clone();
+        let (lo, hi) = (from.max(base), end.min(next));
         let (wanted, fetch) = tokio::task::spawn_blocking(move || {
+            let store_lock = scan.store(FilterKind::Rpa).expect("kept");
             let mut wanted = Vec::new();
             let mut fetch = BTreeSet::new();
-            for (height, filter) in &filters {
-                // A malformed filter cannot hide a payment: its block is read.
-                let values = decode_rpa(filter).ok();
-                let hit = |p: &Prefix| values.as_ref().map_or(true, |v| p.matches(v));
-                if hit(&prefix) {
-                    wanted.push(*height);
-                    fetch.insert(*height);
+            let mut at = lo;
+            while at < hi {
+                let until = at.saturating_add(1000).min(hi);
+                let filters: Vec<(u32, Vec<u8>)> = {
+                    let store = store_lock.read().expect("filters lock");
+                    (at..until)
+                        .map(|h| store.read_checked(h).map(|f| (h, f)))
+                        .collect::<std::io::Result<_>>()?
+                };
+                for (height, filter) in &filters {
+                    // A malformed filter cannot hide a payment: its block is read.
+                    let values = decode_rpa(filter).ok();
+                    let hit = |p: &Prefix| values.as_ref().map_or(true, |v| p.matches(v));
+                    if hit(&prefix) {
+                        wanted.push(*height);
+                        fetch.insert(*height);
+                    }
+                    if covers.iter().any(hit) {
+                        fetch.insert(*height);
+                    }
                 }
-                if covers.iter().any(hit) {
-                    fetch.insert(*height);
-                }
+                at = until;
             }
-            (wanted, fetch)
+            Ok::<_, std::io::Error>((wanted, fetch))
         })
         .await
-        .map_err(|e| Error::new(ErrorKind::Stopped, e.to_string()))?;
+        .map_err(|e| Error::new(ErrorKind::Stopped, e.to_string()))?
+        .map_err(|e| storage_error("input prefix filters", e))?;
         let wanted: HashSet<u32> = wanted.into_iter().collect();
         let mut out = Vec::new();
         let mut queue: VecDeque<(u32, JoinHandle<Result<Arc<Block>>>)> = VecDeque::new();

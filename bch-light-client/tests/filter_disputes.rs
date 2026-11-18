@@ -347,3 +347,71 @@ async fn input_prefix_filters_come_only_from_nodes_that_serve_them() {
     }
     client.shutdown();
 }
+
+/// Only a node without input prefix filters: they never sync past their
+/// start. A search of blocks the client has but whose input prefix filters
+/// it lacks answered nothing found, as if no payment were there; it is now
+/// an error that says how far the filters reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_rpa_search_past_the_input_prefix_filters_is_an_error() {
+    let Some(without) = bchd_txid_binary_or_skip() else {
+        return;
+    };
+    let node = Bchd::start_with(&without, "rpa-past").await;
+    node.generate(30).await;
+    init_tracing();
+    let mut config = Config::new(Network::Regtest, node.dir.join("client"), vec![node.peer()]);
+    config.request_timeout = Duration::from_secs(10);
+    config.learn_peers = false;
+    config.rpa_filters = true;
+    let client = LightClient::start(config).await.expect("start client");
+    client
+        .wait_synced(Duration::from_secs(60))
+        .await
+        .expect("script filters sync");
+    let prefix = bch_light_client::Prefix::new(0xbeef, 16).unwrap();
+    let past = client.rpa_history(prefix, 0, 31).await;
+    assert_eq!(
+        past.as_ref().map_err(|e| e.kind()).err(),
+        Some(bch_light_client::ErrorKind::Unavailable),
+        "{past:?}"
+    );
+    // Blocks that do not exist yet are no error: there is nothing to find.
+    assert!(client.rpa_history(prefix, 40, 50).await.unwrap().is_empty());
+    client.shutdown();
+}
+
+/// More cover prefixes asked for than there are other prefixes of the
+/// length: the search draws them all and goes on (it drew forever).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn more_cover_prefixes_than_exist_still_search() {
+    let Some(with) = bchd_rpa_or_skip() else {
+        return;
+    };
+    let node = Bchd::start_with(&with, "rpa-cover").await;
+    node.generate(20).await;
+    let mut config = Config::new(Network::Regtest, node.dir.join("client"), vec![node.peer()]);
+    config.request_timeout = Duration::from_secs(10);
+    config.learn_peers = false;
+    config.rpa_filters = true;
+    config.rpa_cover_prefixes = 1000;
+    let client = LightClient::start(config).await.expect("start client");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while client.status().rpa_height != Some(20) {
+        assert!(Instant::now() < deadline, "{:?}", client.status());
+        client.poke();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let prefix = bch_light_client::Prefix::new(0x5a, 8).unwrap();
+    let search = tokio::spawn({
+        let client = client.clone();
+        async move { client.rpa_history(prefix, 0, 21).await }
+    });
+    let found = tokio::time::timeout(Duration::from_secs(30), search)
+        .await
+        .expect("the search ended")
+        .unwrap()
+        .unwrap();
+    assert!(found.is_empty());
+    client.shutdown();
+}

@@ -787,7 +787,7 @@ async fn rpa_history(
     from: u32,
     to: Option<u32>,
 ) -> Result<Value> {
-    let Some((start, tip)) = client.rpa_heights() else {
+    let Some((start, _)) = client.rpa_heights() else {
         return Err(RpcError::not_found(
             "RPA support is disabled on this server",
         ));
@@ -795,7 +795,9 @@ async fn rpa_history(
     if to.is_some_and(|to| to <= from) {
         return Ok(json!([]));
     }
-    let tip = tip.or_else(|| client.tip().map(|t| t.0)).unwrap_or(0);
+    // Up to the chain's tip: blocks there whose input prefix filters are not
+    // synced yet make the search an error, never an empty answer.
+    let tip = client.tip().map(|t| t.0).unwrap_or(0);
     let from = from.max(start);
     let end = to
         .unwrap_or(tip + 1)
