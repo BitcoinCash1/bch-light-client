@@ -630,3 +630,77 @@ pub async fn all_blocks(node: &Bchd) -> Vec<Value> {
     }
     out
 }
+
+/// A man in the middle between a client and a node: every message the node
+/// sends passes through `tamper`, which may change its payload (the length
+/// and checksum are made to fit). What the client sends passes unchanged.
+pub struct TamperProxy {
+    pub port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TamperProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl TamperProxy {
+    pub async fn start(node_port: u16, tamper: fn(&str, &mut Vec<u8>)) -> TamperProxy {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(node) = TcpStream::connect(("127.0.0.1", node_port)).await else {
+                    continue;
+                };
+                let (mut from_client, mut to_client) = client.into_split();
+                let (mut from_node, mut to_node) = node.into_split();
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut from_client, &mut to_node).await;
+                });
+                tokio::spawn(async move {
+                    loop {
+                        let mut head = [0u8; 24];
+                        if from_node.read_exact(&mut head).await.is_err() {
+                            return;
+                        }
+                        let len = u32::from_le_bytes(head[16..20].try_into().unwrap()) as usize;
+                        let mut payload = vec![0u8; len];
+                        if from_node.read_exact(&mut payload).await.is_err() {
+                            return;
+                        }
+                        let command = String::from_utf8_lossy(&head[4..16])
+                            .trim_end_matches('\0')
+                            .to_string();
+                        tamper(&command, &mut payload);
+                        head[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+                        head[20..24].copy_from_slice(&hash256(&payload)[..4]);
+                        if to_client.write_all(&head).await.is_err()
+                            || to_client.write_all(&payload).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        TamperProxy { port, task }
+    }
+
+    pub fn peer(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+}
+
+/// Where the filter hashes of a cfheaders payload start, and how many there are.
+pub fn cfheaders_hashes(payload: &[u8]) -> (usize, usize) {
+    // filter type, stop hash, previous filter header, then a count.
+    match payload[65] {
+        0xfd => (
+            68,
+            usize::from(u16::from_le_bytes([payload[66], payload[67]])),
+        ),
+        n => (66, usize::from(n)),
+    }
+}

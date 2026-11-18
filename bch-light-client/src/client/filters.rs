@@ -402,22 +402,25 @@ pub(crate) async fn sync(inner: &Arc<Inner>, kind: FilterKind) -> Result<()> {
     Ok(())
 }
 
-/// Asks a second peer for the same filter headers; where they differ,
-/// settles which peer is wrong and drops it.
+/// Asks a second peer, chosen at random among those that serve filters, for
+/// the same filter headers; where they differ, settles which peer is wrong
+/// and bans it.
 async fn cross_check(
     inner: &Arc<Inner>,
     kind: FilterKind,
     batch: &Batch,
     timeout: Duration,
 ) -> Result<()> {
-    let Some(other) = inner
+    let others: Vec<Arc<Peer>> = inner
         .pool
         .filter_peers()
         .into_iter()
-        .find(|p| p.id != batch.peer.id)
-    else {
+        .filter(|p| p.id != batch.peer.id)
+        .collect();
+    if others.is_empty() {
         return Ok(());
-    };
+    }
+    let other = others[rand::thread_rng().gen_range(0..others.len())].clone();
     let stop = *batch.hashes.last().expect("non-empty batch");
     let Ok(theirs) = request_cfheaders(&other, kind, batch.start, stop, timeout).await else {
         // A peer that does not serve this filter type is no witness.
@@ -428,31 +431,55 @@ async fn cross_check(
     {
         return Ok(());
     }
-    let height = if theirs.prev_header != batch.cfheaders.prev_header {
-        // They differ below this batch: find the first height where they do.
-        first_divergence(inner, kind, &other, batch.start, timeout).await?
-    } else {
+    let stored = inner
+        .store(kind)
+        .expect("store")
+        .read()
+        .expect("filters lock")
+        .prev_header(batch.start);
+    let batch_chains = batch.cfheaders.prev_header == stored;
+    let witness_chains = theirs.prev_header == stored;
+    // Where the two first differ, the claims each made there, and which
+    // peer strayed from the stored filter headers to get there.
+    let (height, claims, strayed) = if batch_chains && witness_chains {
         let i = theirs
             .filter_hashes
             .iter()
             .zip(&batch.cfheaders.filter_hashes)
             .position(|(a, b)| a != b)
             .unwrap_or(0);
-        batch.start + i as u32
+        let claims = (
+            batch.cfheaders.filter_hashes.get(i).copied(),
+            theirs.filter_hashes.get(i).copied(),
+        );
+        (batch.start + i as u32, claims, &other)
+    } else if batch_chains {
+        // The witness differs below this batch.
+        let h = first_divergence(inner, kind, &other, batch.start, timeout).await?;
+        (h, (None, None), &other)
+    } else {
+        // The batch's peer differs below it, whatever the witness says.
+        let h = first_divergence(inner, kind, &batch.peer, batch.start, timeout).await?;
+        (h, (None, None), &batch.peer)
     };
     warn!(kind = kind.name(), height, a = %batch.peer.addr, b = %other.addr, "peers disagree on a filter; settling it");
-    let verdict = settle(inner, kind, height, &batch.peer, &other, timeout).await?;
-    let (bad, good) = match verdict {
-        Verdict::First => (&batch.peer, &other),
-        Verdict::Second => (&other, &batch.peer),
-        Verdict::Same => {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "peers disagree on filters and nothing settles it",
-            ))
-        }
+    let verdict = settle(
+        inner,
+        kind,
+        height,
+        (&batch.peer, claims.0),
+        (&other, claims.1),
+        timeout,
+    )
+    .await?;
+    let (bad, why) = match verdict {
+        Verdict::First => (&batch.peer, "served a wrong filter"),
+        Verdict::Second => (&other, "served a wrong filter"),
+        // Both serve the filter they each claim, and it is the same one: the
+        // headers that differed were not those of the filters it serves.
+        Verdict::Same => (strayed, "gave filter headers its own filters contradict"),
     };
-    inner.pool.ban(&bad.addr, "served a wrong filter");
+    inner.pool.ban(&bad.addr, why);
     if bad.id == batch.peer.id {
         // What we kept from the wrong peer above `height` goes.
         let mut store = inner
@@ -469,10 +496,9 @@ async fn cross_check(
     Err(Error::new(
         ErrorKind::InvalidData,
         format!(
-            "{} served a wrong {} at height {height}; dropped, {} kept",
+            "{} {why} ({} at height {height}); dropped",
             bad.addr,
-            kind.name(),
-            good.addr
+            kind.name()
         ),
     ))
 }
@@ -511,13 +537,42 @@ async fn first_divergence(
     Ok(lo)
 }
 
-/// Which of two peers serves a wrong filter for the block at `height`.
+/// The filter a peer serves for one block, checked against the filter hash
+/// it claims for that block (asked for when not given): None when it serves
+/// none, or one its own claim contradicts.
+async fn consistent_filter(
+    peer: &Peer,
+    kind: FilterKind,
+    height: u32,
+    hash: BlockHash,
+    claim: Option<[u8; 32]>,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let claim = match claim {
+        Some(c) => c,
+        None => *request_cfheaders(peer, kind, height, hash, timeout)
+            .await
+            .ok()?
+            .filter_hashes
+            .first()?,
+    };
+    let filter = request_cfilters(peer, kind, height, &[hash], timeout)
+        .await
+        .ok()?
+        .into_iter()
+        .next()?;
+    (sha256d(&filter) == claim).then_some(filter)
+}
+
+/// Which of two peers serves a wrong filter for the block at `height`,
+/// given the filter hash each claimed there, when known. A peer whose
+/// filter does not hash to its own claim is wrong.
 async fn settle(
     inner: &Arc<Inner>,
     kind: FilterKind,
     height: u32,
-    a: &Arc<Peer>,
-    b: &Arc<Peer>,
+    (a, claim_a): (&Arc<Peer>, Option<[u8; 32]>),
+    (b, claim_b): (&Arc<Peer>, Option<[u8; 32]>),
     timeout: Duration,
 ) -> Result<Verdict> {
     let hash = inner
@@ -526,18 +581,11 @@ async fn settle(
         .expect("chain lock")
         .hash_at(height)
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "no such block"))?;
-    let fa = request_cfilters(a, kind, height, &[hash], timeout)
-        .await
-        .ok()
-        .and_then(|f| f.into_iter().next());
-    let fb = request_cfilters(b, kind, height, &[hash], timeout)
-        .await
-        .ok()
-        .and_then(|f| f.into_iter().next());
-    let (fa, fb) = match (fa, fb) {
-        (None, _) => return Ok(Verdict::First),
-        (_, None) => return Ok(Verdict::Second),
-        (Some(fa), Some(fb)) => (fa, fb),
+    let Some(fa) = consistent_filter(a, kind, height, hash, claim_a, timeout).await else {
+        return Ok(Verdict::First);
+    };
+    let Some(fb) = consistent_filter(b, kind, height, hash, claim_b, timeout).await else {
+        return Ok(Verdict::Second);
     };
     if fa == fb {
         return Ok(Verdict::Same);
