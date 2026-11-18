@@ -659,7 +659,25 @@ impl TamperProxy {
         node_port: u16,
         rewrite: impl Fn(&mut String, &mut Vec<u8>) + Send + Sync + 'static,
     ) -> TamperProxy {
+        Self::full(node_port, rewrite, |_: &str, _: &[u8]| {}).await
+    }
+
+    /// Passes everything unchanged, and shows `observe` every message the
+    /// client sends.
+    pub async fn observing(
+        node_port: u16,
+        observe: impl Fn(&str, &[u8]) + Send + Sync + 'static,
+    ) -> TamperProxy {
+        Self::full(node_port, |_: &mut String, _: &mut Vec<u8>| {}, observe).await
+    }
+
+    async fn full(
+        node_port: u16,
+        rewrite: impl Fn(&mut String, &mut Vec<u8>) + Send + Sync + 'static,
+        observe: impl Fn(&str, &[u8]) + Send + Sync + 'static,
+    ) -> TamperProxy {
         let rewrite = std::sync::Arc::new(rewrite);
+        let observe = std::sync::Arc::new(observe);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let task = tokio::spawn(async move {
@@ -669,8 +687,28 @@ impl TamperProxy {
                 };
                 let (mut from_client, mut to_client) = client.into_split();
                 let (mut from_node, mut to_node) = node.into_split();
+                let observe = observe.clone();
                 tokio::spawn(async move {
-                    let _ = tokio::io::copy(&mut from_client, &mut to_node).await;
+                    loop {
+                        let mut head = [0u8; 24];
+                        if from_client.read_exact(&mut head).await.is_err() {
+                            return;
+                        }
+                        let len = u32::from_le_bytes(head[16..20].try_into().unwrap()) as usize;
+                        let mut payload = vec![0u8; len];
+                        if from_client.read_exact(&mut payload).await.is_err() {
+                            return;
+                        }
+                        let command = String::from_utf8_lossy(&head[4..16])
+                            .trim_end_matches('\0')
+                            .to_string();
+                        observe(&command, &payload);
+                        if to_node.write_all(&head).await.is_err()
+                            || to_node.write_all(&payload).await.is_err()
+                        {
+                            return;
+                        }
+                    }
                 });
                 let rewrite = rewrite.clone();
                 tokio::spawn(async move {

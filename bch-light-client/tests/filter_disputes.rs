@@ -287,12 +287,19 @@ async fn a_wrong_script_filter_is_dropped_with_its_peer() {
     client.shutdown();
 }
 
+/// Requests for filters of type 2 that reached the node without them.
+static TYPE_2_ASKED_OF_PLAIN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Two nodes that both say they serve committed filters, one with input
 /// prefix filters (type 2) and one without, on the same chain. Batches of
 /// type 2 went to both in turn: each one asked of the node without them
 /// went unanswered, timed out, failed the round and closed the connection.
-/// Now each node is asked once which filter types it serves, batches go
-/// only to those that do, and the connection stays.
+/// Now each node is asked once which filter types it serves (getcfcheckpt),
+/// and batches go only to those that do: no getcfheaders or getcfilters of
+/// type 2 reaches the node without them. (bchd also leaves type 1 requests
+/// unanswered for a moment after a new block, while it does not count
+/// itself current: such a batch now goes to the other peer.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn input_prefix_filters_come_only_from_nodes_that_serve_them() {
     let (Some(with), Some(without)) = (bchd_rpa_or_skip(), bchd_txid_binary_or_skip()) else {
@@ -310,12 +317,18 @@ async fn input_prefix_filters_come_only_from_nodes_that_serve_them() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     init_tracing();
+    let watched = TamperProxy::observing(plain.p2p_port, |command, payload| {
+        if matches!(command, "getcfheaders" | "getcfilters") && payload.first() == Some(&2) {
+            TYPE_2_ASKED_OF_PLAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    })
+    .await;
     let mut config = Config::new(
         Network::Regtest,
         rpa.dir.join("client"),
-        vec![plain.peer(), rpa.peer()],
+        vec![watched.peer(), rpa.peer()],
     );
-    config.request_timeout = Duration::from_secs(10);
+    config.request_timeout = Duration::from_secs(30);
     config.learn_peers = false;
     config.rpa_filters = true;
     let client = LightClient::start(config).await.expect("start client");
@@ -331,8 +344,9 @@ async fn input_prefix_filters_come_only_from_nodes_that_serve_them() {
         loop {
             let status = client.status();
             assert_eq!(
-                status.peers, 2,
-                "round {round}: a connection closed: {status:?}"
+                TYPE_2_ASKED_OF_PLAIN.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "round {round}: input prefix filters asked of the node without them"
             );
             if status.filter_height == Some(tip) && status.rpa_height == Some(tip) {
                 break;
