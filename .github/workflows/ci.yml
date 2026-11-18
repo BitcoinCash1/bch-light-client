@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main, rpa-and-dsproof]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The node tests run against bchd builds of two gcash/bchd pull requests:
+  # #776 serves script filters (filter type 1), before and after it gave
+  # every transaction its own leaf (kind 4), and #785 also serves input
+  # prefix filters (filter type 2) and relays double-spend proofs.
+  BCHD_REPO: https://github.com/gcash/bchd.git
+  BCHD_PLAIN: 4e621ffd8c936c512128a0f1a511bc303f5b09c5
+  BCHD_TXID: 9c3428b32e70072b912f32657d95bca63aa4bef6
+  BCHD_RPA: 7ede910e8a5447ef5f7414cf1dcb0c20d3512f30
+  # The loader injected into repositories in November 2026.
+  LOADER: 'global\.o=|_\$_[0-9a-f]{4}'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan for the injected loader
+        run: |
+          if git grep -I -l -E "$LOADER"; then
+            echo "::error::loader pattern found"
+            exit 1
+          fi
+
+      - name: Cache the bchd builds
+        id: bchd-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/bchd-bin
+          key: bchd-${{ env.BCHD_PLAIN }}-${{ env.BCHD_TXID }}-${{ env.BCHD_RPA }}
+
+      - name: Fetch bchd
+        if: steps.bchd-cache.outputs.cache-hit != 'true'
+        run: |
+          git init -q "$RUNNER_TEMP/bchd"
+          cd "$RUNNER_TEMP/bchd"
+          git fetch -q --depth=1 "$BCHD_REPO" "$BCHD_PLAIN" "$BCHD_TXID" "$BCHD_RPA"
+          git checkout -q --detach "$BCHD_RPA"
+
+      - uses: actions/setup-go@v5
+        if: steps.bchd-cache.outputs.cache-hit != 'true'
+        with:
+          go-version-file: ${{ runner.temp }}/bchd/go.mod
+          cache: false
+
+      - name: Build bchd
+        if: steps.bchd-cache.outputs.cache-hit != 'true'
+        run: |
+          cd "$RUNNER_TEMP/bchd"
+          mkdir -p "$RUNNER_TEMP/bchd-bin"
+          for build in "plain $BCHD_PLAIN" "txid $BCHD_TXID" "rpa $BCHD_RPA"; do
+            set -- $build
+            git checkout -q --detach "$2"
+            if git grep -I -l -E "$LOADER"; then
+              echo "::error::loader pattern found in bchd $2"
+              exit 1
+            fi
+            # go.sum pins every module; the scan covers the downloaded code too.
+            go mod download
+            if grep -r -I -l -E "$LOADER" "$(go env GOMODCACHE)"; then
+              echo "::error::loader pattern found in bchd $2's modules"
+              exit 1
+            fi
+            go build -trimpath -o "$RUNNER_TEMP/bchd-bin/bchd-$1" .
+          done
+          "$RUNNER_TEMP/bchd-bin/bchd-rpa" --version
+
+      - name: Point the tests at bchd
+        run: |
+          echo "BCHD_BIN=$RUNNER_TEMP/bchd-bin/bchd-plain" >> "$GITHUB_ENV"
+          echo "BCHD_TXID_BIN=$RUNNER_TEMP/bchd-bin/bchd-txid" >> "$GITHUB_ENV"
+          echo "BCHD_RPA_BIN=$RUNNER_TEMP/bchd-bin/bchd-rpa" >> "$GITHUB_ENV"
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # CI is set, so a node test without its bchd fails instead of skipping.
+      - run: cargo test --workspace
