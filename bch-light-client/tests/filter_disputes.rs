@@ -194,12 +194,10 @@ async fn a_wrong_input_prefix_filter_does_not_stop_histories() {
     let deadline = Instant::now() + Duration::from_secs(60);
     let history = loop {
         if client.status().filter_height == Some(111) {
-            if let Ok(h) =
+            if let Ok(Ok(h)) =
                 tokio::time::timeout(Duration::from_secs(10), client.history(&target)).await
             {
-                if let Ok(h) = h {
-                    break h;
-                }
+                break h;
             }
         }
         assert!(
