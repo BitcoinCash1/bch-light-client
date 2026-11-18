@@ -704,6 +704,39 @@ impl TamperProxy {
         Self::full(node_port, |_: &mut String, _: &mut Vec<u8>| {}, observe).await
     }
 
+    /// Passes everything but the node's block announcements: a headers
+    /// message the client did not ask for, or an inv with a block, reaches
+    /// the client under another name, which it ignores.
+    pub async fn without_block_announcements(node_port: u16) -> TamperProxy {
+        // getheaders the client sent and the node has not answered yet.
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let answered = asked.clone();
+        Self::full(
+            node_port,
+            move |command: &mut String, payload: &mut Vec<u8>| {
+                let announcement = match command.as_str() {
+                    "headers" => {
+                        let mut open = answered.lock().unwrap();
+                        let unasked = *open == 0;
+                        *open = open.saturating_sub(1);
+                        unasked
+                    }
+                    "inv" => inv_has_block(payload),
+                    _ => false,
+                };
+                if announcement {
+                    *command = "announcement".into();
+                }
+            },
+            move |command: &str, _: &[u8]| {
+                if command == "getheaders" {
+                    *asked.lock().unwrap() += 1;
+                }
+            },
+        )
+        .await
+    }
+
     async fn full(
         node_port: u16,
         rewrite: impl Fn(&mut String, &mut Vec<u8>) + Send + Sync + 'static,
@@ -779,6 +812,19 @@ impl TamperProxy {
     pub fn peer(&self) -> String {
         format!("127.0.0.1:{}", self.port)
     }
+}
+
+/// Whether an inv payload lists a block.
+fn inv_has_block(payload: &[u8]) -> bool {
+    let (start, count) = match payload.first() {
+        Some(0xfd) if payload.len() >= 3 => {
+            (3, usize::from(u16::from_le_bytes([payload[1], payload[2]])))
+        }
+        Some(&n) if n < 0xfd => (1, usize::from(n)),
+        _ => return false,
+    };
+    (0..count)
+        .any(|i| payload.get(start + i * 36..start + i * 36 + 4) == Some(&2u32.to_le_bytes()[..]))
 }
 
 /// Where the filter hashes of a cfheaders payload start, and how many there are.

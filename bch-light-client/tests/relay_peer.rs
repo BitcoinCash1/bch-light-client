@@ -213,3 +213,55 @@ async fn a_broadcast_is_taken_in_when_another_node_announces_it() {
     }
     client.shutdown();
 }
+
+/// A relay peer announces a block before the node that serves filters has
+/// it, and that node never announces it (kth before it announced blocks):
+/// the client asks it again until it has the block, instead of waiting for
+/// its next round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_block_a_relay_peer_announces_first_is_taken_once_a_filter_node_has_it() {
+    let Some(bin) = bchd_or_skip() else {
+        return;
+    };
+    let filters = Bchd::start_with(&bin, "announce-filters").await;
+    let relay = Bchd::start_args(&bin, "announce-relay", &["--nocfilters"]).await;
+    // The same chain on both, and no link between them.
+    for hash in filters.generate(3).await {
+        let raw = filters.rpc("getblock", json!([hash, false])).await;
+        relay.rpc("submitblock", json!([raw])).await;
+    }
+    assert_eq!(relay.height().await, 3);
+    let proxy = TamperProxy::without_block_announcements(filters.p2p_port).await;
+
+    let dir = filters.dir.join("client");
+    let mut config = Config::new(Network::Regtest, &dir, vec![proxy.peer(), relay.peer()]);
+    config.learn_peers = false;
+    let client = LightClient::start(config).await.expect("start client");
+    client
+        .wait_synced(Duration::from_secs(20))
+        .await
+        .expect("synced from the node that serves filters");
+    wait_for("both nodes connected", || async {
+        client.status().peers == 2
+    })
+    .await;
+    assert_eq!(client.status().filter_height, Some(3));
+
+    let hash = relay.generate(1).await.remove(0);
+    // The client hears of it from the relay node, and finds that the other
+    // does not have it yet.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let raw = relay.rpc("getblock", json!([hash, false])).await;
+    filters.rpc("submitblock", json!([raw])).await;
+    assert_eq!(filters.height().await, 4);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while client.status().filter_height != Some(4) {
+        assert!(
+            Instant::now() < deadline,
+            "the announced block not taken 10 s after the node that serves filters had it: {:?}",
+            client.status()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    client.stop().await;
+}

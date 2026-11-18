@@ -362,6 +362,10 @@ struct Inner {
     live_tip: Mutex<Option<u32>>,
     /// The tip last announced with `Event::Tip`.
     announced_tip: Mutex<Option<(u32, BlockHash)>>,
+    /// The last block a peer announced that the chain did not have, and
+    /// when: a relay peer may announce a block before the nodes that serve
+    /// filters have it, and they may never announce it.
+    announced_block: Mutex<Option<(BlockHash, std::time::Instant)>>,
     requested: Mutex<HashSet<Txid>>,
     shutdown: watch::Sender<bool>,
 }
@@ -491,6 +495,7 @@ impl LightClient {
             txid_keys: Mutex::new(None),
             live_tip: Mutex::new(None),
             announced_tip: Mutex::new(None),
+            announced_block: Mutex::new(None),
             requested: Mutex::new(HashSet::new()),
             shutdown,
             config,
@@ -1218,7 +1223,8 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
                 let Ok(items) = decode_inv(&message.payload) else {
                     continue;
                 };
-                if items.iter().any(|i| i.kind == INV_BLOCK) {
+                if let Some(block) = items.iter().rev().find(|i| i.kind == INV_BLOCK) {
+                    note_announced(&inner, BlockHash(block.hash));
                     inner.wake.notify_one();
                 }
                 let mut wanted: Vec<Inv> = dsproofs::wanted(&inner, &items);
@@ -1244,7 +1250,15 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
                     }
                 }
             }
-            "headers" => inner.wake.notify_one(),
+            "headers" => {
+                if let Some(last) = decode_headers(&message.payload)
+                    .ok()
+                    .and_then(|headers| headers.last().map(|(_, header)| header.hash()))
+                {
+                    note_announced(&inner, last);
+                }
+                inner.wake.notify_one();
+            }
             crate::dsproof::COMMAND => dsproofs::on_relayed(&inner, message.payload),
             "addr" if inner.config.learn_peers => {
                 if let Ok(addrs) = crate::p2p::pool::decode_addr(&message.payload) {
@@ -1328,6 +1342,45 @@ fn on_mempool_tx(inner: &Arc<Inner>, tx: Transaction) {
     dsproofs::on_mempool_tx(inner, &tx);
 }
 
+/// How long the sync loop waits for a wake-up before a round of its own.
+const SYNC_PAUSE: Duration = Duration::from_secs(30);
+/// While a block a peer announced is not in the chain, the nodes that serve
+/// filters are asked for headers this often, for at most ANNOUNCED_FOR.
+const ANNOUNCED_RETRY: Duration = Duration::from_secs(1);
+const ANNOUNCED_FOR: Duration = Duration::from_secs(60);
+
+/// Notes a block a peer announced, when the chain does not have it.
+fn note_announced(inner: &Inner, hash: BlockHash) {
+    if inner
+        .chain
+        .read()
+        .expect("chain lock")
+        .height_of(&hash)
+        .is_none()
+    {
+        *inner.announced_block.lock().expect("announced lock") =
+            Some((hash, std::time::Instant::now()));
+    }
+}
+
+/// Whether a block a peer announced lately is still not in the chain.
+fn awaiting_announced(inner: &Inner) -> bool {
+    let mut announced = inner.announced_block.lock().expect("announced lock");
+    let awaiting = announced.is_some_and(|(hash, since)| {
+        since.elapsed() < ANNOUNCED_FOR
+            && inner
+                .chain
+                .read()
+                .expect("chain lock")
+                .height_of(&hash)
+                .is_none()
+    });
+    if !awaiting {
+        *announced = None;
+    }
+    awaiting
+}
+
 async fn sync_loop(inner: Arc<Inner>) {
     let mut shutdown = inner.shutdown.subscribe();
     loop {
@@ -1343,9 +1396,14 @@ async fn sync_loop(inner: Arc<Inner>) {
             warn!(error = %e, "sync round failed");
             inner.state.send_modify(|s| s.synced = false);
         }
+        let pause = if awaiting_announced(&inner) {
+            ANNOUNCED_RETRY
+        } else {
+            SYNC_PAUSE
+        };
         tokio::select! {
             _ = inner.wake.notified() => {}
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            _ = tokio::time::sleep(pause) => {}
             _ = shutdown.changed() => {}
         }
     }
