@@ -11,6 +11,12 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 
 async fn start(node: &Bchd, dir: &std::path::Path, birthday: u32) -> LightClient {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .with_test_writer()
+        .try_init();
     let mut config = Config::new(Network::Regtest, dir, vec![node.peer()]);
     config.filters_from_height = birthday;
     config.request_timeout = Duration::from_secs(20);
@@ -138,8 +144,12 @@ async fn birthday_restart_and_reorg_mempool() {
     assert!(birthday_filters * 4 < genesis_filters);
 
     // A restart reads the history from disk and downloads no block for it.
-    client.shutdown();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    client.stop().await;
+    assert_eq!(
+        client.status().peers,
+        0,
+        "stopped with its connections closed"
+    );
     let client = start(&node, &birthday_dir, 2400).await;
     wait_tip(&node, &client).await;
     let again = client.history(&target).await.unwrap();

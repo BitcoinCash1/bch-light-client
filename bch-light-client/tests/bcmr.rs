@@ -178,8 +178,7 @@ async fn authchains_are_followed_to_their_authhead_and_registry() {
         chain.steps,
         vec![(txid_of(&three), Some(115)), (txid_of(&burn), Some(116))]
     );
-    client.shutdown();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    client.stop().await;
 
     // After a restart, the records still resume it; a registry's authchain
     // extension (the authbase and the first update) gets there too.

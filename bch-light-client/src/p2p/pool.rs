@@ -273,7 +273,10 @@ impl Pool {
     }
 
     /// Keeps the service connections up until `shutdown` turns true.
-    pub fn spawn_maintainer(self: &Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+    pub fn spawn_maintainer(
+        self: &Arc<Self>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let pool = Arc::clone(self);
         tokio::spawn(async move {
             loop {
@@ -289,7 +292,7 @@ impl Pool {
             for peer in pool.service.write().expect("pool lock").drain(..) {
                 peer.close();
             }
-        });
+        })
     }
 
     async fn maintain(&self) {

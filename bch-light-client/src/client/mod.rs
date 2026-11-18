@@ -331,6 +331,8 @@ struct Inner {
     /// The latest identity transaction (and its height) found for each
     /// authbase resolved: the wallet's own records.
     identities: Mutex<HashMap<Txid, (Txid, u32)>>,
+    /// The background tasks, for LightClient::stop to wait for.
+    tasks: Mutex<Vec<JoinHandle<()>>>,
     /// The network's data folder.
     dir: PathBuf,
     generation: AtomicU64,
@@ -455,6 +457,7 @@ impl LightClient {
             served: Mutex::new(filters::Served::default()),
             filter_types: Mutex::new(HashMap::new()),
             identities: Mutex::new(tokens::load_identities(&dir)),
+            tasks: Mutex::new(Vec::new()),
             dir: dir.clone(),
             generation: AtomicU64::new(0),
             targets: Mutex::new(watched),
@@ -479,9 +482,12 @@ impl LightClient {
             shutdown,
             config,
         });
-        inner.pool.spawn_maintainer(inner.shutdown.subscribe());
-        tokio::spawn(event_loop(inner.clone(), peer_events));
-        tokio::spawn(sync_loop(inner.clone()));
+        let tasks = vec![
+            inner.pool.spawn_maintainer(inner.shutdown.subscribe()),
+            tokio::spawn(event_loop(inner.clone(), peer_events)),
+            tokio::spawn(sync_loop(inner.clone())),
+        ];
+        *inner.tasks.lock().expect("tasks lock") = tasks;
         Ok(LightClient { inner })
     }
 
@@ -489,6 +495,18 @@ impl LightClient {
     pub fn shutdown(&self) {
         let _ = self.inner.shutdown.send(true);
         self.inner.wake.notify_waiters();
+    }
+
+    /// Stops the background tasks, as [`LightClient::shutdown`] does, and
+    /// returns once they have ended and the connections are closed: the
+    /// data folder may then be opened again.
+    pub async fn stop(&self) {
+        self.shutdown();
+        let tasks: Vec<JoinHandle<()>> =
+            std::mem::take(&mut *self.inner.tasks.lock().expect("tasks lock"));
+        for task in tasks {
+            let _ = task.await;
+        }
     }
 
     /// Changes as they happen. A receiver that falls behind gets `Lagged`
@@ -1307,7 +1325,12 @@ async fn sync_loop(inner: Arc<Inner>) {
         if *shutdown.borrow() {
             break;
         }
-        if let Err(e) = sync_once(&inner).await {
+        // A round stops where it waits when the client stops.
+        let round = tokio::select! {
+            result = sync_once(&inner) => result,
+            _ = shutdown.changed() => break,
+        };
+        if let Err(e) = round {
             warn!(error = %e, "sync round failed");
             inner.state.send_modify(|s| s.synced = false);
         }
