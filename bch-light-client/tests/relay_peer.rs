@@ -162,3 +162,55 @@ async fn a_node_without_filters_relays_and_is_never_asked_for_filters() {
     synced_at(114).await;
     client.shutdown();
 }
+
+/// A node that takes a broadcast transaction but never gives it back when
+/// asked, as BCHN serves only transactions it announced to the asker: the
+/// broadcast is known to be taken in when another node announces it. Two
+/// connections to one bchd, one through a man in the middle that answers
+/// every transaction with notfound; broadcasts go to each in turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broadcast_is_taken_in_when_another_node_announces_it() {
+    let Some(bin) = bchd_or_skip() else {
+        return;
+    };
+    let node = Bchd::start_with(&bin, "relay-echo").await;
+    node.generate(110).await;
+    let silent = TamperProxy::rewriting(node.p2p_port, |command, payload| {
+        if command == "tx" {
+            let mut inv = vec![1u8];
+            inv.extend_from_slice(&1u32.to_le_bytes());
+            inv.extend_from_slice(&hash256(payload));
+            *command = "notfound".to_string();
+            *payload = inv;
+        }
+    })
+    .await;
+    let mut config = Config::new(
+        Network::Regtest,
+        node.dir.join("client"),
+        vec![silent.peer(), node.peer()],
+    );
+    config.request_timeout = Duration::from_secs(30);
+    config.learn_peers = false;
+    let client = LightClient::start(config).await.expect("start client");
+    wait_for("both connected", || async { client.status().peers == 2 }).await;
+    client.wait_synced(Duration::from_secs(30)).await.unwrap();
+    for height in 1..=2u32 {
+        let (coinbase, value) = node.coinbase(height).await;
+        let tx = TxSpec {
+            inputs: vec![(coinbase, Unlock::Redeem(vec![0x51]))],
+            outputs: vec![(value - 3000, mining_script(), vec![])],
+        }
+        .build();
+        let started = Instant::now();
+        let sent = client.broadcast(&tx).await.expect("taken in");
+        assert_eq!(sent, txid_of(&tx));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(in_mempool(&node, &sent.to_hex()).await);
+    }
+    client.shutdown();
+}

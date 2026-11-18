@@ -647,6 +647,19 @@ impl Drop for TamperProxy {
 
 impl TamperProxy {
     pub async fn start(node_port: u16, tamper: fn(&str, &mut Vec<u8>)) -> TamperProxy {
+        Self::rewriting(
+            node_port,
+            move |command: &mut String, payload: &mut Vec<u8>| tamper(command, payload),
+        )
+        .await
+    }
+
+    /// Like `start`, and `rewrite` may change the command too.
+    pub async fn rewriting(
+        node_port: u16,
+        rewrite: impl Fn(&mut String, &mut Vec<u8>) + Send + Sync + 'static,
+    ) -> TamperProxy {
+        let rewrite = std::sync::Arc::new(rewrite);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let task = tokio::spawn(async move {
@@ -659,6 +672,7 @@ impl TamperProxy {
                 tokio::spawn(async move {
                     let _ = tokio::io::copy(&mut from_client, &mut to_node).await;
                 });
+                let rewrite = rewrite.clone();
                 tokio::spawn(async move {
                     loop {
                         let mut head = [0u8; 24];
@@ -670,10 +684,13 @@ impl TamperProxy {
                         if from_node.read_exact(&mut payload).await.is_err() {
                             return;
                         }
-                        let command = String::from_utf8_lossy(&head[4..16])
+                        let mut command = String::from_utf8_lossy(&head[4..16])
                             .trim_end_matches('\0')
                             .to_string();
-                        tamper(&command, &mut payload);
+                        rewrite(&mut command, &mut payload);
+                        let mut name = [0u8; 12];
+                        name[..command.len()].copy_from_slice(command.as_bytes());
+                        head[4..16].copy_from_slice(&name);
                         head[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
                         head[20..24].copy_from_slice(&hash256(&payload)[..4]);
                         if to_client.write_all(&head).await.is_err()

@@ -924,8 +924,30 @@ impl LightClient {
                 .await
                 .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no peer connected"))?
         };
+        // Taken in when the peer gives it back when asked, or when another
+        // node announces it: BCHN gives back only transactions it announced
+        // to the asker, never to the peer it got one from. One the mempool
+        // copy holds already was relayed to the client, so it is taken in.
+        let mut events = inner.events.subscribe();
+        let held = self.in_mempool(&txid);
         peer.send("tx", raw.to_vec());
-        let accepted = accepted_by(&peer, txid, inner.config.request_timeout).await;
+        let announced = async {
+            loop {
+                match events.recv().await {
+                    Ok(Event::MempoolTx { txid: t }) if t == txid => return,
+                    Err(broadcast::error::RecvError::Closed) => std::future::pending().await,
+                    _ => {}
+                }
+            }
+        };
+        let accepted = if held {
+            Ok(())
+        } else {
+            tokio::select! {
+                result = accepted_by(&peer, txid, inner.config.request_timeout) => result,
+                () = announced => Ok(()),
+            }
+        };
         if isolate {
             peer.close();
         }
