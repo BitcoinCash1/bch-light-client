@@ -12,6 +12,7 @@ use crate::dispute::{
 };
 use crate::p2p::message::CfHeaders;
 use crate::rpa;
+use std::collections::BTreeMap;
 
 /// Which filters a store holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +34,38 @@ impl FilterKind {
             FilterKind::Script => "script filters",
             FilterKind::Rpa => "input prefix filters",
         }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            FilterKind::Script => 0,
+            FilterKind::Rpa => 1,
+        }
+    }
+}
+
+/// Which peer served each run of stored filters, by kind: first height to
+/// (last height, peer). Not kept across restarts.
+#[derive(Default)]
+pub(crate) struct Served([BTreeMap<u32, (u32, PeerAddr)>; 2]);
+
+/// The peer that served the stored filter of `kind` at `height`, when known.
+pub(crate) fn served_by(inner: &Inner, kind: FilterKind, height: u32) -> Option<PeerAddr> {
+    let served = inner.served.lock().expect("served lock");
+    served.0[kind.index()]
+        .range(..=height)
+        .next_back()
+        .filter(|(_, (last, _))| *last >= height)
+        .map(|(_, (_, addr))| addr.clone())
+}
+
+/// Forgets who served the filters of `kind` from `height` up, which went.
+pub(crate) fn forget_served(inner: &Inner, kind: FilterKind, height: u32) {
+    let mut served = inner.served.lock().expect("served lock");
+    let runs = &mut served.0[kind.index()];
+    runs.retain(|first, _| *first < height);
+    if let Some((_, (last, _))) = runs.range_mut(..height).next_back() {
+        *last = (*last).min(height.saturating_sub(1));
     }
 }
 
@@ -382,6 +415,10 @@ pub(crate) async fn sync(inner: &Arc<Inner>, kind: FilterKind) -> Result<()> {
         store
             .append(&items)
             .map_err(|e| storage_error("filters", e))?;
+        if let Some(last) = (items.len() as u32).checked_sub(1) {
+            inner.served.lock().expect("served lock").0[kind.index()]
+                .insert(batch.start, (batch.start + last, batch.peer.addr.clone()));
+        }
         let tip_now = store.tip();
         drop(chain);
         drop(store);
@@ -491,6 +528,8 @@ async fn cross_check(
             store
                 .truncate_from(height)
                 .map_err(|e| storage_error("filters", e))?;
+            drop(store);
+            forget_served(inner, kind, height);
         }
     }
     Err(Error::new(

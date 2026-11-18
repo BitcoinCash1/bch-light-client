@@ -323,6 +323,7 @@ struct Inner {
     rpa_filters: Option<RwLock<FilterStore>>,
     stats: Counters,
     dsproofs: Mutex<dsproofs::DsProofs>,
+    served: Mutex<filters::Served>,
     /// The network's data folder.
     dir: PathBuf,
     generation: AtomicU64,
@@ -444,6 +445,7 @@ impl LightClient {
             rpa_filters,
             stats: Counters::default(),
             dsproofs: Mutex::new(dsproofs::DsProofs::default()),
+            served: Mutex::new(filters::Served::default()),
             dir: dir.clone(),
             generation: AtomicU64::new(0),
             targets: Mutex::new(watched),
@@ -1427,6 +1429,7 @@ fn on_reorg(inner: &Arc<Inner>, fork: u32) -> Result<()> {
                 .expect("filters lock")
                 .truncate_from(fork + 1)
                 .map_err(|e| storage_error("filters", e))?;
+            filters::forget_served(inner, kind, fork + 1);
         }
     }
     // Their transactions go back to the mempool copy, as nodes put them
@@ -1564,39 +1567,36 @@ async fn block_at(inner: &Arc<Inner>, height: u32) -> Result<Arc<Block>> {
         .hash_at(height)
         .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no block at height {height}")))?;
     let block = inner.fetcher.get(hash).await?;
-    let filter = inner
-        .filters
-        .read()
-        .expect("filters lock")
-        .read_checked(height);
-    if let Ok(filter) = filter {
-        if inner
-            .filters
-            .read()
-            .expect("filters lock")
-            .block_hash(height)
-            == Some(hash)
-        {
-            let check = check_block(&block, &filter).map_err(|e| {
-                Error::with_source(ErrorKind::InvalidData, format!("block {height}"), e)
-            })?;
-            check_rpa_filter(inner, height, &block)?;
-            let mut known = inner.txid_keys.lock().expect("lock");
-            if *known != Some(check.has_txid_keys) {
-                info!(
-                    supported = check.has_txid_keys,
-                    "filters with transaction keys"
-                );
-                *known = Some(check.has_txid_keys);
+    let filter = {
+        let store = inner.filters.read().expect("filters lock");
+        (store.block_hash(height) == Some(hash))
+            .then(|| store.read_checked(height).ok())
+            .flatten()
+    };
+    if let Some(filter) = filter {
+        match check_block(&block, &filter) {
+            Ok(check) => {
+                let mut known = inner.txid_keys.lock().expect("lock");
+                if *known != Some(check.has_txid_keys) {
+                    info!(
+                        supported = check.has_txid_keys,
+                        "filters with transaction keys"
+                    );
+                    *known = Some(check.has_txid_keys);
+                }
+            }
+            Err(e) => {
+                warn!(height, error = %e, "a script filter does not match its block");
+                drop_wrong_filters(inner, FilterKind::Script, height)?;
             }
         }
     }
+    check_rpa_filter(inner, height, &block)?;
     Ok(block)
 }
 
 /// A block against its stored input prefix filter, rebuilt from the block.
-/// A filter that does not match was served wrong: it goes, and is fetched
-/// again from the peers.
+/// A filter that does not match was served wrong (see [`drop_wrong_filters`]).
 fn check_rpa_filter(inner: &Arc<Inner>, height: u32, block: &Block) -> Result<()> {
     let Some(store) = inner.store(FilterKind::Rpa) else {
         return Ok(());
@@ -1610,19 +1610,57 @@ fn check_rpa_filter(inner: &Arc<Inner>, height: u32, block: &Block) -> Result<()
     };
     let Some(stored) = stored else { return Ok(()) };
     if crate::rpa::build(block) != stored {
-        store
-            .write()
-            .expect("filters lock")
-            .truncate_from(height)
-            .map_err(|e| storage_error("filters", e))?;
-        inner
-            .state
-            .send_modify(|s| s.rpa_tip = height.checked_sub(1));
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("the input prefix filter of block {height} does not match the block"),
-        ));
+        warn!(height, "an input prefix filter does not match its block");
+        drop_wrong_filters(inner, FilterKind::Rpa, height)?;
     }
+    Ok(())
+}
+
+/// A stored filter that its block contradicts: the peer that served it is
+/// banned, and it goes with every filter above it, to be fetched again from
+/// the other peers. Histories read from script filters at or above it are
+/// read again. The block itself, checked against its header, stays usable.
+fn drop_wrong_filters(inner: &Arc<Inner>, kind: FilterKind, height: u32) -> Result<()> {
+    if let Some(addr) = filters::served_by(inner, kind, height) {
+        inner
+            .pool
+            .ban(&addr, "served a filter its block contradicts");
+    }
+    let store = inner.store(kind).expect("store");
+    store
+        .write()
+        .expect("filters lock")
+        .truncate_from(height)
+        .map_err(|e| storage_error("filters", e))?;
+    filters::forget_served(inner, kind, height);
+    let below = height.checked_sub(1);
+    inner.state.send_modify(|s| match kind {
+        FilterKind::Script => {
+            s.filter_tip = s.filter_tip.min(below);
+            s.synced = false;
+        }
+        FilterKind::Rpa => s.rpa_tip = s.rpa_tip.min(below),
+    });
+    if kind == FilterKind::Script {
+        let fork = below.unwrap_or(0);
+        let changed: Vec<Target> = {
+            let mut states = inner.targets.lock().expect("targets lock");
+            states
+                .values_mut()
+                .filter_map(|s| s.rollback(fork).then(|| s.target.clone()))
+                .collect()
+        };
+        {
+            let mut live = inner.live_tip.lock().expect("live lock");
+            *live = live.map(|l| l.min(fork));
+        }
+        inner.generation.fetch_add(1, Ordering::SeqCst);
+        persist::save(inner);
+        for target in changed {
+            inner.emit(Event::TargetChanged { target });
+        }
+    }
+    inner.wake.notify_one();
     Ok(())
 }
 
