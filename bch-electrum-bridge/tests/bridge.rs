@@ -796,3 +796,101 @@ async fn rpa_and_dsproof_methods() {
         json!({"mempoolminfee": 0.00001, "minrelaytxfee": 0.00001})
     );
 }
+
+/// The bridge's own identity methods (light_client.bcmr.*, not Fulcrum's),
+/// against bchd with transaction keys: an authbase and one update that
+/// publishes a registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bcmr_extension_methods() {
+    let Some(bin) = bchd_txid_binary_or_skip() else {
+        return;
+    };
+    let node = Bchd::start_with(&bin, "bridge-bcmr").await;
+    node.generate(110).await;
+    let redeem = vec![0x57, 0x75, 0x51];
+    let identity = p2sh20(&redeem);
+    let (cb, value) = node.coinbase(1).await;
+    let authbase = TxSpec {
+        inputs: vec![(cb, Unlock::Redeem(vec![0x51]))],
+        outputs: vec![(value - 2000, identity.clone(), vec![])],
+    }
+    .build();
+    let authbase_id = node.send(&authbase).await;
+    node.generate(1).await;
+    let registry = br#"{"version":{"major":0,"minor":1,"patch":0}}"#.to_vec();
+    let mut publication = vec![0x6a, 0x04, b'B', b'C', b'M', b'R', 0x20];
+    publication.extend_from_slice(&sha256(&registry));
+    publication.push(11);
+    publication.extend_from_slice(b"example.com");
+    let update = TxSpec {
+        inputs: vec![(
+            OutPoint::new(bch_light_client::Txid::from_hex(&authbase_id).unwrap(), 0),
+            Unlock::Redeem(redeem.clone()),
+        )],
+        outputs: vec![
+            (value - 4000, identity.clone(), vec![]),
+            (0, publication, vec![]),
+        ],
+    }
+    .build();
+    let update_id = node.send(&update).await;
+    node.generate(1).await;
+
+    let port = free_port();
+    let log = std::fs::File::create(node.dir.join("bridge.log")).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_bch-electrum-bridge"))
+        .args(["--network", "regtest", "--no-rpa", "--peer", &node.peer()])
+        .args(["--listen", &format!("127.0.0.1:{port}")])
+        .arg("--datadir")
+        .arg(node.dir.join("bridge-data"))
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("start bridge");
+    let _bridge = Bridge { child };
+    let mut w = Wallet::connect(port).await;
+    w.call("server.version", json!(["test-wallet", "1.5"]))
+        .await;
+    wait_bridge_tip(&mut w, node.height().await).await;
+    let chain = w
+        .call("light_client.bcmr.resolve", json!([authbase_id]))
+        .await;
+    assert_eq!(chain["authhead"], json!(update_id));
+    assert_eq!(chain["height"], json!(112));
+    assert_eq!(chain["burned"], json!(false));
+    assert_eq!(chain["publication"]["uris"], json!(["example.com"]));
+    assert_eq!(
+        chain["publication"]["hash"],
+        json!(hex::encode(sha256(&registry)))
+    );
+    assert_eq!(
+        w.call(
+            "light_client.bcmr.verify_registry",
+            json!([hex::encode(&registry), chain["publication"]["hash"]])
+        )
+        .await,
+        json!(true)
+    );
+    assert_eq!(
+        w.call(
+            "light_client.bcmr.verify_registry",
+            json!(["00", chain["publication"]["hash"]])
+        )
+        .await,
+        json!(false)
+    );
+    let extended = w
+        .call(
+            "light_client.bcmr.resolve_extension",
+            json!([authbase_id, [hex::encode(&authbase)]]),
+        )
+        .await;
+    assert_eq!(extended["authhead"], json!(update_id));
+    let wrong = w
+        .reply(
+            "light_client.bcmr.resolve_extension",
+            json!([authbase_id, [hex::encode(&update)]]),
+        )
+        .await;
+    assert!(wrong["error"].is_object(), "{wrong}");
+}

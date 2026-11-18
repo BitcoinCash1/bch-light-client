@@ -1,12 +1,13 @@
 //! The Electrum protocol methods, each answered through the light client.
 
 use crate::session::{RpcError, ScriptSub, Session};
+use bch_light_client::bcmr::{registry_matches, Publication};
 use bch_light_client::block::BlockHeader;
 use bch_light_client::cashaddr::Address;
 use bch_light_client::script;
 use bch_light_client::{
-    BlockHash, DsProofInfo, ErrorKind, History, LightClient, OutPoint, Prefix, Target, TokenData,
-    TokenFilter, Transaction, Txid,
+    Authchain, BlockHash, Category, DsProofInfo, ErrorKind, History, LightClient, Nft, OutPoint,
+    Prefix, Target, TokenData, TokenFilter, Transaction, Txid,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -719,6 +720,78 @@ pub async fn call(session: &Arc<Session>, method: &str, params: &[Value]) -> Res
             let txid = txid_arg(params, 0)?;
             Ok(json!(session.state.lock().expect("session lock").dsproofs.remove(&txid).is_some()))
         }
+        // Extensions of this bridge, not Fulcrum's: tokens and identities
+        // without an index. Their names say so.
+        "light_client.token.balances" => {
+            let (target, _) = scripthash_arg(params)?;
+            let balances = client.token_balances(&target).await?;
+            Ok(json!(balances
+                .iter()
+                .map(|b| json!({
+                    "category": b.category.to_hex(),
+                    "amount": b.fungible.to_string(),
+                    "nfts": nfts_json(&b.nfts),
+                }))
+                .collect::<Vec<_>>()))
+        }
+        "light_client.token.supply" => {
+            let category = category_arg(params, 0)?;
+            let s = client.token_supply(category).await?;
+            Ok(json!({
+                "category": s.category.to_hex(),
+                "total": s.total.to_string(),
+                "reserved": s.reserved.to_string(),
+                "circulating": s.circulating.to_string(),
+                "nfts": {"minting": s.minting, "mutable": s.mutable, "immutable": s.immutable},
+                "holders": s.holders.iter().map(|h| json!({
+                    "scripthash": reversed_hex(&bch_light_client::hash::sha256(&h.script)),
+                    "amount": h.fungible.to_string(),
+                    "nfts": nfts_json(&h.nfts),
+                })).collect::<Vec<_>>(),
+                "height": s.height,
+            }))
+        }
+        "light_client.token.genesis" => {
+            let category = category_arg(params, 0)?;
+            let info = client.token_genesis(category).await.map_err(lookup_error)?;
+            Ok(json!({
+                "tx_hash": info.tx.txid().to_hex(),
+                "height": info.confirmation.map_or(0, |c| c.height),
+                "block_hash": info.confirmation.map(|c| c.block_hash.to_hex()),
+            }))
+        }
+        "light_client.bcmr.resolve" => {
+            let authbase = txid_arg(params, 0)?;
+            let hint = u32_arg(params, 1, "authbase height")?;
+            let track = bool_arg(params, 2)?;
+            let chain = client.resolve_authchain(authbase, hint, track).await?;
+            Ok(authchain_json(&chain))
+        }
+        "light_client.bcmr.resolve_extension" => {
+            let authbase = txid_arg(params, 0)?;
+            let raw: Vec<Vec<u8>> = arg(params, 1)
+                .and_then(Value::as_array)
+                .ok_or_else(|| RpcError::params("missing or bad authchain"))?
+                .iter()
+                .map(|v| v.as_str().and_then(|s| hex::decode(s).ok()))
+                .collect::<Option<_>>()
+                .ok_or_else(|| RpcError::params("the authchain is a list of hex transactions"))?;
+            let track = bool_arg(params, 2)?;
+            let chain = client.resolve_authchain_from(authbase, &raw, track).await?;
+            Ok(authchain_json(&chain))
+        }
+        "light_client.bcmr.verify_registry" => {
+            let registry = hex::decode(str_arg(params, 0, "registry")?)
+                .map_err(|_| RpcError::params("the registry is hex"))?;
+            let mut hash = [0u8; 32];
+            hex::decode_to_slice(str_arg(params, 1, "hash")?, &mut hash)
+                .map_err(|_| RpcError::params("the hash is 32 bytes of hex, as published"))?;
+            let publication = Publication::Registry {
+                hash,
+                uris: vec![],
+            };
+            Ok(json!(registry_matches(&registry, &publication)))
+        }
         "light_client.stats" => {
             let stats = client.stats();
             let status = client.status();
@@ -826,6 +899,45 @@ fn hash_arg(params: &[Value], i: usize, what: &str) -> Result<[u8; 32]> {
     Txid::from_hex(text)
         .map(|t| t.0)
         .map_err(|_| RpcError::params(what.to_string()))
+}
+
+fn category_arg(params: &[Value], i: usize) -> Result<Category> {
+    Category::from_hex(str_arg(params, i, "category")?)
+        .map_err(|_| RpcError::params("Invalid category"))
+}
+
+fn nfts_json(nfts: &[(OutPoint, Nft)]) -> Vec<Value> {
+    nfts.iter()
+        .map(|(outpoint, nft)| {
+            json!({
+                "tx_hash": outpoint.txid.to_hex(),
+                "tx_pos": outpoint.vout,
+                "capability": nft.capability.as_str(),
+                "commitment": hex::encode(&nft.commitment),
+            })
+        })
+        .collect()
+}
+
+/// An authchain as the bridge's light_client.bcmr.* methods answer it.
+fn authchain_json(chain: &Authchain) -> Value {
+    let publication = match &chain.publication {
+        None => Value::Null,
+        Some(Publication::Malformed) => json!({"malformed": true}),
+        Some(Publication::Registry { hash, uris }) => {
+            json!({"hash": hex::encode(hash), "uris": uris})
+        }
+    };
+    json!({
+        "authbase": chain.authbase.to_hex(),
+        "authhead": chain.authhead.txid().to_hex(),
+        "height": chain.authhead_confirmation.map_or(0, |c| c.height),
+        "identity_output": {"tx_hash": chain.identity_output.txid.to_hex(), "tx_pos": chain.identity_output.vout},
+        "burned": chain.burned,
+        "publication": publication,
+        "claims": chain.claims.iter().map(hex::encode).collect::<Vec<_>>(),
+        "steps": chain.steps.iter().map(|(txid, height)| json!({"tx_hash": txid.to_hex(), "height": height.unwrap_or(0)})).collect::<Vec<_>>(),
+    })
 }
 
 /// A proof as Fulcrum shows one: IDs in display order.

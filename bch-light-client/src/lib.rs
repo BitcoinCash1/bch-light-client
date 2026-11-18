@@ -65,6 +65,7 @@
     clippy::chunks_exact_with_const_size
 )]
 
+pub mod bcmr;
 pub mod block;
 pub mod cashaddr;
 pub mod chain;
@@ -89,9 +90,9 @@ pub mod script;
 pub mod tx;
 
 pub use client::{
-    Balance, Config, Confirmation, DsProofInfo, Event, FeeEstimate, History, LightClient,
-    MempoolEntry, MempoolSummary, MerkleProof, OutputInfo, RpaMatch, Stats, Status, TokenFilter,
-    TxInfo, Utxo,
+    balances_of, supply_of, Authchain, Balance, CategoryBalance, Config, Confirmation, DsProofInfo,
+    Event, FeeEstimate, History, LightClient, MempoolEntry, MempoolSummary, MerkleProof,
+    OutputInfo, RpaMatch, Stats, Status, TokenFilter, TokenHolding, TokenSupply, TxInfo, Utxo,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use hash::{BlockHash, Txid};

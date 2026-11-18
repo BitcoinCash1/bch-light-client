@@ -36,7 +36,7 @@ const SIGHASH_ANYONECANPAY: u8 = 0x80;
 
 /// The next instruction at `*pos`: its opcode and, for a push, the data.
 /// None when a push runs past the end of the script.
-fn read_op<'a>(script: &'a [u8], pos: &mut usize) -> Option<(u8, &'a [u8])> {
+pub fn read_op<'a>(script: &'a [u8], pos: &mut usize) -> Option<(u8, &'a [u8])> {
     let opcode = *script.get(*pos)?;
     *pos += 1;
     if opcode > OP_PUSHDATA4 {

@@ -38,9 +38,11 @@ mod dsproofs;
 mod filters;
 mod persist;
 mod rpa_search;
+mod tokens;
 pub use dsproofs::DsProofInfo;
 use filters::{store_base, FilterKind};
 pub use rpa_search::RpaMatch;
+pub use tokens::{balances_of, supply_of, Authchain, CategoryBalance, TokenHolding, TokenSupply};
 
 /// How the client reaches the network and how much it downloads.
 #[derive(Debug, Clone)]
@@ -326,6 +328,9 @@ struct Inner {
     served: Mutex<filters::Served>,
     /// Which filter types (script, input prefix) each connection serves, once asked.
     filter_types: Mutex<HashMap<u64, [Option<bool>; 2]>>,
+    /// The latest identity transaction (and its height) found for each
+    /// authbase resolved: the wallet's own records.
+    identities: Mutex<HashMap<Txid, (Txid, u32)>>,
     /// The network's data folder.
     dir: PathBuf,
     generation: AtomicU64,
@@ -449,6 +454,7 @@ impl LightClient {
             dsproofs: Mutex::new(dsproofs::DsProofs::default()),
             served: Mutex::new(filters::Served::default()),
             filter_types: Mutex::new(HashMap::new()),
+            identities: Mutex::new(tokens::load_identities(&dir)),
             dir: dir.clone(),
             generation: AtomicU64::new(0),
             targets: Mutex::new(watched),

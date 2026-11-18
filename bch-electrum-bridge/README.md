@@ -58,3 +58,28 @@ the bridge knows no fee for the rest, so the histogram leaves out mostly
 transactions that spend older coins. `blockchain.estimatefee` takes the
 median of those fee rates and of the last 24 blocks' known ones, and never
 less than the relay fee the peers ask.
+
+## Methods of this bridge, not Fulcrum's
+
+Fulcrum's methods keep Fulcrum's names and answers, token data and
+`token_filter` included. Tokens and identities beyond them are answered
+under the `light_client.` prefix, which no Electrum server has; wallets
+that use them know they talk to this bridge. Every answer comes from the
+library without an index: a category's outputs from its filter keys, an
+identity's authchain from the filter keys of each identity output's script,
+with the blocks downloaded as for histories (with `--decoy-blocks`, and
+over Tor circuits of their own behind `--proxy`).
+
+| Method | Parameters | Answer |
+|---|---|---|
+| `light_client.token.balances` | scripthash | per category: `category`, `amount` (fungible, a string), `nfts` |
+| `light_client.token.supply` | category | `total`, `reserved` (in minting or mutable outputs), `circulating` (strings), NFT counts by capability, `holders` by scripthash, and the `height` counted to; the category is watched from then on |
+| `light_client.token.genesis` | category | the genesis transaction's `tx_hash`, `height` (0 in the mempool) and `block_hash` |
+| `light_client.bcmr.resolve` | authbase, [authbase height], [track] | the authchain's `authhead`, its `height`, `identity_output`, `burned`, `publication` (`hash` and `uris`), other `claims`, and the `steps` followed; resumes from the last identity transaction found; with `track`, the identity output is watched, so an update notifies its script's subscribers |
+| `light_client.bcmr.resolve_extension` | authbase, [hex transactions of a registry's `authchain` extension], [track] | as above, after checking the extension starts at the authbase, follows output 0, and ends on the chain |
+| `light_client.bcmr.verify_registry` | registry bytes (hex), published hash (hex) | whether the registry hashes to what its publication output commits to |
+
+The bridge never fetches a registry: the wallet downloads it from the
+publication's URIs (HTTPS or IPFS) and checks it with
+`light_client.bcmr.verify_registry`. A category's genesis and an identity's
+authchain are found only from the filters' start height (`--birthday`) on.
