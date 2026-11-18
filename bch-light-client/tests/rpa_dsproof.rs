@@ -13,24 +13,7 @@ use bch_light_client::{Config, Event, LightClient, Network, OutPoint, Prefix, Ta
 use common::*;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
-
-pub fn bchd_rpa_binary() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("BCHD_RPA_BIN") {
-        return Some(PathBuf::from(path));
-    }
-    let exe = if cfg!(windows) {
-        "bchd-rpa.exe"
-    } else {
-        "bchd-rpa"
-    };
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join(".tools")
-        .join(exe);
-    path.exists().then_some(path)
-}
 
 /// The value an input has in an input prefix filter, computed here from the
 /// input's fields: the first two bytes of the double SHA-256 of the input.
@@ -142,8 +125,7 @@ async fn found(client: &LightClient, prefix: Prefix, tip: u32) -> BTreeSet<(Stri
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rpa_payments_and_double_spend_proofs() {
-    let Some(bin) = bchd_rpa_binary() else {
-        eprintln!("skipped: no bchd with input prefix filters (set BCHD_RPA_BIN)");
+    let Some(bin) = bchd_rpa_or_skip() else {
         return;
     };
     let node = Bchd::start_with(&bin, "rpa").await;

@@ -107,32 +107,6 @@ async fn a_peer_whose_headers_do_not_chain_is_dropped() {
     client.shutdown();
 }
 
-/// bchd that serves input prefix filters: $BCHD_RPA_BIN or .tools/bchd-rpa.
-fn bchd_rpa_or_skip() -> Option<std::path::PathBuf> {
-    let path = std::env::var("BCHD_RPA_BIN")
-        .map(Into::into)
-        .unwrap_or_else(|_| {
-            let exe = if cfg!(windows) {
-                "bchd-rpa.exe"
-            } else {
-                "bchd-rpa"
-            };
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join(".tools")
-                .join(exe)
-        });
-    if path.exists() {
-        return Some(path);
-    }
-    assert!(
-        std::env::var_os("CI").is_none(),
-        "bchd with input prefix filters is missing (set BCHD_RPA_BIN)"
-    );
-    eprintln!("skipped: no bchd with input prefix filters (set BCHD_RPA_BIN)");
-    None
-}
-
 /// The block whose input prefix filter the liar replaces, internal order.
 static WRONG_RPA_BLOCK: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 

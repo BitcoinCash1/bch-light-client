@@ -74,6 +74,32 @@ pub fn bchd_txid_binary_or_skip() -> Option<PathBuf> {
     )
 }
 
+/// A bchd that serves input prefix filters (type 2) and relays double-spend
+/// proofs: $BCHD_RPA_BIN, or .tools/bchd-rpa(.exe).
+pub fn bchd_rpa_binary() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("BCHD_RPA_BIN") {
+        return Some(PathBuf::from(path));
+    }
+    let exe = if cfg!(windows) {
+        "bchd-rpa.exe"
+    } else {
+        "bchd-rpa"
+    };
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(".tools")
+        .join(exe);
+    path.exists().then_some(path)
+}
+
+/// A bchd with input prefix filters, or None (skipped) outside CI.
+pub fn bchd_rpa_or_skip() -> Option<PathBuf> {
+    required(
+        bchd_rpa_binary(),
+        "bchd with input prefix filters (set BCHD_RPA_BIN)",
+    )
+}
+
 /// A port the OS gives out now; bchd binds it right after.
 pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -157,51 +183,58 @@ impl Bchd {
 
     /// Starts the given bchd binary with more options.
     pub async fn start_args(bin: &Path, name: &str, extra: &[&str]) -> Bchd {
-        let dir =
-            std::env::temp_dir().join(format!("bch-light-client-it-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let p2p_port = free_port();
-        let rpc_port = free_port();
-        let log = std::fs::File::create(dir.join("stdout.log")).unwrap();
-        let child = Command::new(bin)
-            .arg("--regtest")
-            .arg(format!("--datadir={}", dir.join("data").display()))
-            .arg(format!("--logdir={}", dir.join("logs").display()))
-            .arg(format!("--listen=127.0.0.1:{p2p_port}"))
-            .arg(format!("--rpclisten=127.0.0.1:{rpc_port}"))
-            .arg("--rpcuser=u")
-            .arg("--rpcpass=p")
-            .arg("--notls")
-            .arg(format!("--miningaddr={MINING_ADDRESS}"))
-            .arg(format!(
-                "--debuglevel={}",
-                std::env::var("BCHD_DEBUGLEVEL").unwrap_or_else(|_| "info".into())
-            ))
-            .args(extra)
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .expect("start bchd");
-        let node = Bchd {
-            child,
-            p2p_port,
-            rpc_port,
-            dir,
-        };
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if node.rpc_raw("getblockcount", json!([])).await.is_ok() {
-                break;
+        // free_port hands out a port another process may take before bchd
+        // binds it: bchd then exits, and is started again on other ports.
+        for _ in 0..3 {
+            let dir = std::env::temp_dir()
+                .join(format!("bch-light-client-it-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let p2p_port = free_port();
+            let rpc_port = free_port();
+            let log = std::fs::File::create(dir.join("stdout.log")).unwrap();
+            let child = Command::new(bin)
+                .arg("--regtest")
+                .arg(format!("--datadir={}", dir.join("data").display()))
+                .arg(format!("--logdir={}", dir.join("logs").display()))
+                .arg(format!("--listen=127.0.0.1:{p2p_port}"))
+                .arg(format!("--rpclisten=127.0.0.1:{rpc_port}"))
+                .arg("--rpcuser=u")
+                .arg("--rpcpass=p")
+                .arg("--notls")
+                .arg(format!("--miningaddr={MINING_ADDRESS}"))
+                .arg(format!(
+                    "--debuglevel={}",
+                    std::env::var("BCHD_DEBUGLEVEL").unwrap_or_else(|_| "info".into())
+                ))
+                .args(extra)
+                .stdout(Stdio::from(log.try_clone().unwrap()))
+                .stderr(Stdio::from(log))
+                .spawn()
+                .expect("start bchd");
+            let mut node = Bchd {
+                child,
+                p2p_port,
+                rpc_port,
+                dir,
+            };
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if node.rpc_raw("getblockcount", json!([])).await.is_ok() {
+                    return node;
+                }
+                if matches!(node.child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "bchd did not start; see {}",
+                    node.dir.display()
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            assert!(
-                Instant::now() < deadline,
-                "bchd did not start; see {}",
-                node.dir.display()
-            );
-            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        node
+        panic!("bchd exited at start three times; see its stdout.log");
     }
 
     pub fn peer(&self) -> String {

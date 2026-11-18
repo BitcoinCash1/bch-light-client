@@ -154,8 +154,7 @@ async fn compare(node: &Bchd, client: &LightClient, targets: &[(&str, Target)], 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn histories_match_bchd_through_blocks_mempool_and_a_reorg() {
     init_tracing();
-    let Some(bin) = bchd_binary() else {
-        eprintln!("skipped: no bchd binary (set BCHD_BIN)");
+    let Some(bin) = bchd_or_skip() else {
         return;
     };
     histories_scenario(&bin, "histories", false).await;
@@ -166,8 +165,7 @@ async fn histories_match_bchd_through_blocks_mempool_and_a_reorg() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn histories_and_txid_lookups_with_transaction_keys() {
     init_tracing();
-    let Some(bin) = bchd_txid_binary() else {
-        eprintln!("skipped: no bchd with transaction keys (set BCHD_TXID_BIN)");
+    let Some(bin) = bchd_txid_binary_or_skip() else {
         return;
     };
     histories_scenario(&bin, "histories-txid", true).await;
@@ -544,8 +542,7 @@ async fn histories_scenario(bin: &std::path::Path, name: &str, txid_keys: bool) 
 #[ignore = "takes minutes; run with --ignored"]
 async fn measure_sync_and_lookups() {
     init_tracing();
-    if bchd_binary().is_none() {
-        eprintln!("skipped: no bchd binary (set BCHD_BIN)");
+    if bchd_or_skip().is_none() {
         return;
     }
     let blocks: u32 = std::env::var("MEASURE_BLOCKS")
@@ -640,8 +637,7 @@ async fn measure_sync_and_lookups() {
 #[ignore = "waits two minutes; run with --ignored"]
 async fn service_connection_stays_up_when_idle() {
     init_tracing();
-    let Some(bin) = bchd_binary() else {
-        eprintln!("skipped: no bchd binary (set BCHD_BIN)");
+    let Some(bin) = bchd_or_skip() else {
         return;
     };
     let node = Bchd::start_with(&bin, "idle").await;

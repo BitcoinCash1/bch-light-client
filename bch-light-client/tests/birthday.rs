@@ -97,8 +97,7 @@ async fn header_of(node: &Bchd, height: u32) -> BlockHeader {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn birthday_restart_and_reorg_mempool() {
-    if bchd_binary().is_none() {
-        eprintln!("skipped: no bchd binary (set BCHD_BIN)");
+    if bchd_or_skip().is_none() {
         return;
     }
     let node = Bchd::start("birthday").await;

@@ -28,8 +28,7 @@ async fn in_mempool(node: &Bchd, txid: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_without_filters_relays_and_is_never_asked_for_filters() {
-    let Some(bin) = bchd_binary() else {
-        eprintln!("skipped: no bchd binary (set BCHD_BIN)");
+    let Some(bin) = bchd_or_skip() else {
         return;
     };
     let filters = Bchd::start_args(&bin, "relay-filters", &["--nopeerbloomfilters"]).await;

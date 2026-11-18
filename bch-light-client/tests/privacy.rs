@@ -73,24 +73,6 @@ async fn a_watched_payment_fee_is_never_looked_up() {
     client.shutdown();
 }
 
-/// bchd that serves input prefix filters and relays double-spend proofs:
-/// $BCHD_RPA_BIN, or .tools/bchd-rpa(.exe).
-fn bchd_rpa_binary() -> Option<std::path::PathBuf> {
-    if let Ok(path) = std::env::var("BCHD_RPA_BIN") {
-        return Some(path.into());
-    }
-    let exe = if cfg!(windows) {
-        "bchd-rpa.exe"
-    } else {
-        "bchd-rpa"
-    };
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join(".tools")
-        .join(exe);
-    path.exists().then_some(path)
-}
-
 /// A double-spend proof of a coin the client does not hold (no watched
 /// script's, not of the last blocks) is not checked by fetching the coin's
 /// block: which proofs make the client download, and which do not, would
@@ -98,16 +80,10 @@ fn bchd_rpa_binary() -> Option<std::path::PathBuf> {
 /// and nothing is downloaded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_proof_of_a_coin_not_held_downloads_nothing() {
-    let found = bchd_rpa_binary();
-    if found.is_none() {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "bchd with input prefix filters is missing (set BCHD_RPA_BIN)"
-        );
-        eprintln!("skipped: no bchd with input prefix filters (set BCHD_RPA_BIN)");
+    let Some(bin) = bchd_rpa_or_skip() else {
         return;
-    }
-    let node = Bchd::start_with(&found.unwrap(), "privacy-proof").await;
+    };
+    let node = Bchd::start_with(&bin, "privacy-proof").await;
     node.generate(110).await;
     let key = Key::new(41);
     let (coinbase, value) = node.coinbase(1).await;

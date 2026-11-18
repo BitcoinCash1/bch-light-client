@@ -134,8 +134,7 @@ async fn wait_bridge_tip(wallet: &mut Wallet, height: u32) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn electrum_answers_match_bchd() {
-    if bchd_binary().is_none() {
-        eprintln!("skipped: no bchd binary (set BCHD_BIN)");
+    if bchd_or_skip().is_none() {
         return;
     }
     let node = Bchd::start("bridge").await;
@@ -488,22 +487,6 @@ async fn electrum_answers_match_bchd() {
     );
 }
 
-fn bchd_rpa_binary() -> Option<std::path::PathBuf> {
-    if let Ok(path) = std::env::var("BCHD_RPA_BIN") {
-        return Some(path.into());
-    }
-    let exe = if cfg!(windows) {
-        "bchd-rpa.exe"
-    } else {
-        "bchd-rpa"
-    };
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join(".tools")
-        .join(exe);
-    path.exists().then_some(path)
-}
-
 fn rpa_value(outpoint: OutPoint, sequence: u32) -> u16 {
     let mut b = outpoint.txid.0.to_vec();
     b.extend_from_slice(&outpoint.vout.to_le_bytes());
@@ -536,8 +519,7 @@ fn ground_spend(outpoint: OutPoint, value: u64, prefix: u16, script: &[u8]) -> V
 /// argument order, limits and result shapes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rpa_and_dsproof_methods() {
-    let Some(bin) = bchd_rpa_binary() else {
-        eprintln!("skipped: no bchd with input prefix filters (set BCHD_RPA_BIN)");
+    let Some(bin) = bchd_rpa_or_skip() else {
         return;
     };
     let node = Bchd::start_with(&bin, "bridge-rpa").await;
