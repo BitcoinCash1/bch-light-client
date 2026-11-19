@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, rpa-and-dsproof]
+    branches: [main, privacy/defaults]
   pull_request:
   workflow_dispatch:
 
