@@ -18,6 +18,8 @@ pub struct Shared {
     pub network: Network,
     pub banner: String,
     pub donation_address: String,
+    /// Whether blockchain.rpa.* are answered.
+    pub rpa: bool,
 }
 
 /// A JSON-RPC error.

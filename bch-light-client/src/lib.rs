@@ -24,38 +24,85 @@
 //! # Ok(()) }
 //! ```
 //!
-//! # What peers can learn
+//! # What peers can learn, and the defaults that limit it
+//!
+//! The defaults protect: nothing has to be turned on.
 //!
 //! - **Service peers** (a few long-lived connections) serve headers and all
-//!   filters, relay every transaction they accept, and see every new block
-//!   at the tip fetched, since the client downloads all of them. None of
-//!   that depends on what the wallet watches. They see a broadcast
-//!   transaction's origin unless it goes through a proxy. A configured node
+//!   filters, and relay every transaction they accept. They also see every
+//!   new block at the tip fetched, since the client downloads all of them.
+//!   None of that depends on what the wallet watches. A configured node
 //!   that serves no filters (such as BCHN) is a service peer for headers,
-//!   blocks, relay, its mempool and double-spend proofs, and is never asked
-//!   for filters.
-//! - **Block downloads for a scan** are the one place interest shows: a peer
-//!   that serves a block a wallet needed learns that the block is one of
-//!   those the wallet's filters matched. A peer that sees the same client
-//!   fetch two or three such blocks could intersect their scripts and find
-//!   the address, so downloads are spread out:
-//!   - *Direct connections:* blocks go round the peers, a different peer for
-//!     each block in turn. Every peer still sees this host's IP address, so
-//!     the blocks one peer serves are linkable to each other, and peers that
-//!     share what they see can link all of them. Use several unrelated peers.
-//!   - *Through a SOCKS5 proxy such as Tor* (the default once a proxy is
-//!     set): each block is fetched over a new connection with its own
-//!     random SOCKS credentials, which Tor puts on its own circuit, so peers
-//!     cannot link one download to another by address. What is left is
-//!     timing: downloads close together in time can be guessed to belong
-//!     together.
-//!   - [`Config::decoy_blocks`] adds random blocks to each scan, and
-//!     [`Config::download_all_blocks`] fetches every block of a scanned
-//!     range, so that which blocks are fetched says nothing at all.
-//! - **Lookups by transaction ID** fetch the block the filters point to,
-//!   which shows interest in that block in the same way.
+//!   relay, its mempool and double-spend proofs, and is never asked for
+//!   filters.
+//! - **Block downloads for a lookup** are the one place interest shows: a
+//!   peer that serves a block a wallet needed learns that someone wanted
+//!   it. So by default:
+//!   - Each block comes over a connection of its own
+//!     ([`Config::isolate_block_downloads`]). The service peers do not see
+//!     which blocks follow, and no peer sees two blocks asked for over one
+//!     connection.
+//!     - Through a SOCKS5 proxy such as Tor, each such connection has its
+//!       own random credentials, which Tor puts on a circuit of its own,
+//!       so peers cannot link downloads by address either.
+//!     - Without a proxy, every peer still sees this host's IP address. Use
+//!       a proxy, or several unrelated peers.
+//!   - Each needed block brings three decoys ([`Config::decoy_blocks`])
+//!     from its bucket of 144 heights. Decoy `draw` of the block at
+//!     `height` is SHA-256(seed, height, draw) modulo 144, with a seed made
+//!     once for the data folder (`decoys.seed`). The same block brings the
+//!     same decoys in every session, so a peer that intersects what several
+//!     sessions downloaded learns nothing new. A block in the bucket at the
+//!     tip, which is not complete yet, brings that whole bucket.
+//!   - Every lookup takes the same cover: histories, transactions by ID or
+//!     by position, output spends, token geneses and the spenders of
+//!     identity outputs.
+//!   - A transaction found once is kept (10,000 at most), so asking again,
+//!     as a subscription does, downloads nothing. The same goes for an
+//!     output checked for a spender.
+//!   - An RPA search downloads every block of its range
+//!     ([`Config::rpa_whole_ranges`]), so which blocks it reads names no
+//!     prefix, and it needs no input prefix filters.
+//!   - [`Config::download_all_blocks`] goes further for histories, and
+//!     reads every block of a scanned range.
+//! - **A broadcast** goes over a connection of its own too, so the node
+//!   that takes it in does not see it come from a connection that fetched
+//!   the wallet's blocks. Without a proxy, the node sees this host's IP
+//!   address.
+//! - **The user agent** is Bitcoin Cash Node's current release
+//!   ([`DEFAULT_USER_AGENT`]), the most common one on the network. A user
+//!   agent of the client's own would mark every connection and link them
+//!   together. The rest of the version message (no services, no address)
+//!   still shows that a light client connected.
 //! - Peer host names go to the proxy unresolved; the client makes no DNS
 //!   lookups of its own through a proxy.
+//!
+//! # What the protections cost
+//!
+//! The `what_the_cover_costs` test measures this: bytes a bchd on regtest
+//! sent for one operation on a fresh client, with blocks of about 300
+//! bytes.
+//!
+//! | Operation | Defaults | Decoys and isolation off |
+//! |---|---|---|
+//! | A history needing 3 blocks: two in one bucket, one in the bucket at the tip | 23,141 bytes, 20 blocks | 882 bytes, 3 blocks |
+//! | A transaction by ID | 4,750 bytes, 4 blocks | 294 bytes, 1 block |
+//! | An RPA search of 60 blocks | 68,727 bytes, 60 blocks | 294 bytes, the one matching block |
+//!
+//! Regtest blocks are tiny, so these numbers are mostly handshakes: each
+//! connection of its own costs about 900 bytes of version messages. On
+//! mainnet the blocks dominate:
+//! - Each needed block costs four blocks instead of one. A block in the
+//!   bucket at the tip costs that whole bucket, up to 144 blocks.
+//! - An RPA search costs every block of its range.
+//!
+//! With blocks of 300 KB, for example:
+//! - A history that touches 100 blocks downloads about 120 MB instead of
+//!   30 MB, once: histories are saved, and transactions found are kept.
+//! - A 60-block RPA search (Fulcrum's limit) downloads about 18 MB,
+//!   whatever the prefix.
+//!
+//! That is the price of a peer learning nothing.
 
 // `is_multiple_of` and `as_chunks` are newer than the Rust some wallets
 // that embed this library build with.
@@ -93,6 +140,7 @@ pub use client::{
     balances_of, supply_of, Authchain, Balance, CategoryBalance, Config, Confirmation, DsProofInfo,
     Event, FeeEstimate, History, LightClient, MempoolEntry, MempoolSummary, MerkleProof,
     OutputInfo, RpaMatch, Stats, Status, TokenFilter, TokenHolding, TokenSupply, TxInfo, Utxo,
+    DEFAULT_USER_AGENT,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use hash::{BlockHash, Txid};

@@ -1,8 +1,11 @@
-//! Finding transactions that may pay a reusable payment address: blocks
-//! whose input prefix filters hold the prefix, downloaded whole (spread over
-//! peers, and with cover prefixes if configured), and the first 30 inputs of
-//! each transaction tested here. No request names the prefix. The wallet
-//! then tests the candidates with its scan key.
+//! Finding transactions that may pay a reusable payment address: by default
+//! every block of the searched range is downloaded and the first 30 inputs
+//! of each transaction tested here, so which blocks are read names no
+//! prefix. With `Config::rpa_whole_ranges` off, only the blocks whose input
+//! prefix filters hold the prefix are read (with cover prefixes if
+//! configured): fewer bytes, but the blocks read depend on the prefix. No
+//! request names the prefix either way. The wallet then tests the
+//! candidates with its scan key.
 
 use super::*;
 use crate::rpa::{decode as decode_rpa, matching_inputs, Prefix};
@@ -32,13 +35,48 @@ impl LightClient {
         Some((store.base(), store.tip()))
     }
 
+    /// Where RPA searches start: `Config::rpa_from_height`, else the
+    /// network's usual RPA start height or the birthday, whichever is later.
+    /// With `rpa_whole_ranges` off, where the input prefix filters start.
+    pub fn rpa_start_height(&self) -> u32 {
+        let config = &self.inner.config;
+        if !config.rpa_whole_ranges {
+            if let Some((base, _)) = self.rpa_heights() {
+                return base;
+            }
+        }
+        config.rpa_from_height.unwrap_or(
+            config
+                .network
+                .params()
+                .rpa_start_height
+                .max(config.filters_from_height),
+        )
+    }
+
     /// Confirmed transactions in blocks [from, to) with an input whose hash
-    /// has the prefix, in chain order. Heights before the input prefix
-    /// filters' start height are not searched, nor heights past the chain's
-    /// tip. A range with blocks whose filters are not synced yet is an
-    /// error (Unavailable): answering nothing would say no payment is there.
+    /// has the prefix, in chain order. Heights past the chain's tip are not
+    /// searched. By default every block of the range is downloaded. With
+    /// `Config::rpa_whole_ranges` off the input prefix filters choose the
+    /// blocks: heights before their start are not searched, and a range
+    /// with blocks whose filters are not synced yet is an error
+    /// (Unavailable), as answering nothing would say no payment is there.
     pub async fn rpa_history(&self, prefix: Prefix, from: u32, to: u32) -> Result<Vec<RpaMatch>> {
         let inner = &self.inner;
+        if inner.config.rpa_whole_ranges {
+            let tip = inner.chain.read().expect("chain lock").tip_height();
+            let mut out = Vec::new();
+            cover::download_in_order(
+                inner,
+                from..to.min(tip.saturating_add(1)),
+                |height, block| {
+                    out.extend(matches_in(&block, height, &prefix));
+                    Ok(())
+                },
+            )
+            .await?;
+            return Ok(out);
+        }
         let store_lock = inner.store(FilterKind::Rpa).ok_or_else(|| {
             Error::new(
                 ErrorKind::Unsupported,
@@ -135,31 +173,15 @@ impl LightClient {
             let block = task
                 .await
                 .map_err(|e| Error::new(ErrorKind::Stopped, e.to_string()))??;
-            if !wanted.contains(&height) {
-                continue;
-            }
-            let block_hash = block.hash();
-            for (position, tx) in block.txs.iter().enumerate().skip(1) {
-                let inputs = matching_inputs(tx, &prefix);
-                if !inputs.is_empty() {
-                    out.push(RpaMatch {
-                        tx: tx.clone(),
-                        confirmation: Some(Confirmation {
-                            height,
-                            block_hash,
-                            position: position as u32,
-                        }),
-                        inputs,
-                        fee: None,
-                        unconfirmed_parent: false,
-                    });
-                }
+            if wanted.contains(&height) {
+                out.extend(matches_in(&block, height, &prefix));
             }
         }
         Ok(out)
     }
 
-    /// Mempool transactions with an input whose hash has the prefix: those
+    /// Mempool transactions with an input whose hash has the prefix (no
+    /// download, and no input prefix filters needed): those
     /// without unconfirmed parents first, then by transaction ID.
     pub fn rpa_mempool(&self, prefix: Prefix) -> Vec<RpaMatch> {
         let mempool = self.inner.mempool.read().expect("mempool lock");
@@ -179,4 +201,30 @@ impl LightClient {
         out.sort_by_cached_key(|m| (m.unconfirmed_parent, m.tx.txid().to_hex()));
         out
     }
+}
+
+/// The transactions of `block` with an input, among their first 30, whose
+/// hash has the prefix.
+fn matches_in(block: &Block, height: u32, prefix: &Prefix) -> Vec<RpaMatch> {
+    let block_hash = block.hash();
+    block
+        .txs
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(position, tx)| {
+            let inputs = matching_inputs(tx, prefix);
+            (!inputs.is_empty()).then(|| RpaMatch {
+                tx: tx.clone(),
+                confirmation: Some(Confirmation {
+                    height,
+                    block_hash,
+                    position: position as u32,
+                }),
+                inputs,
+                fee: None,
+                unconfirmed_parent: false,
+            })
+        })
+        .collect()
 }

@@ -33,7 +33,7 @@ fn init_tracing() {
 async fn client(node: &Bchd, name: &str, isolate: bool) -> LightClient {
     let dir = node.dir.join(format!("client-{name}"));
     let mut config = Config::new(Network::Regtest, dir, vec![node.peer()]);
-    config.isolate_block_downloads = Some(isolate);
+    config.isolate_block_downloads = isolate;
     config.request_timeout = Duration::from_secs(20);
     LightClient::start(config).await.expect("start client")
 }
