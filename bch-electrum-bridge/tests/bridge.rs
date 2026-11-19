@@ -134,8 +134,7 @@ async fn wait_bridge_tip(wallet: &mut Wallet, height: u32) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn electrum_answers_match_bchd() {
-    if bchd_binary().is_none() {
-        eprintln!("skipped: no bchd binary (set BCHD_BIN)");
+    if bchd_or_skip().is_none() {
         return;
     }
     let node = Bchd::start("bridge").await;
@@ -227,7 +226,7 @@ async fn electrum_answers_match_bchd() {
             h
         })
         .collect();
-    let mut root = bch_light_client::block::merkle_fold(leaf, 5, &branch);
+    let mut root = bch_light_client::block::merkle_fold(leaf, 5, &branch).expect("a true position");
     root.reverse();
     assert_eq!(json!(hex::encode(root)), proof["root"]);
     let headers = w.call("blockchain.block.headers", json!([0, 10])).await;
@@ -278,7 +277,8 @@ async fn electrum_answers_match_bchd() {
     // The NFT at the P2SH32 output, by its token-aware CashAddr.
     let address = Address::from_script(&holder, true)
         .unwrap()
-        .encode("bchreg");
+        .encode("bchreg")
+        .unwrap();
     let unspent = w
         .call(
             "blockchain.address.listunspent",
@@ -318,6 +318,41 @@ async fn electrum_answers_match_bchd() {
         verbose["blockhash"],
         node.rpc("getblockhash", json!([111])).await
     );
+    // Scripts as BCHN's getrawtransaction shows them, which Fulcrum passes on.
+    let pay_spk = &verbose["vout"][0]["scriptPubKey"];
+    assert_eq!(
+        pay_spk["asm"],
+        json!(format!(
+            "OP_DUP OP_HASH160 {} OP_EQUALVERIFY OP_CHECKSIG",
+            hex::encode(&p2pkh[3..23])
+        ))
+    );
+    assert_eq!(pay_spk["type"], json!("pubkeyhash"));
+    assert_eq!(pay_spk["reqSigs"], json!(1));
+    let plain = Address::from_script(&p2pkh, false).unwrap();
+    assert_eq!(
+        pay_spk["addresses"],
+        json!([plain.encode("bchreg").unwrap()])
+    );
+    // The redeem script OP_1, pushed as the byte 0x51: the number 81.
+    assert_eq!(verbose["vin"][0]["scriptSig"]["asm"], json!("81"));
+    // A token output's address is token-unaware, as BCHN writes it.
+    let mint_verbose = w
+        .call(
+            "blockchain.transaction.get",
+            json!([txid_of(&mint).to_hex(), true]),
+        )
+        .await;
+    let holder_spk = &mint_verbose["vout"][0]["scriptPubKey"];
+    assert_eq!(holder_spk["type"], json!("scripthash"));
+    assert_eq!(
+        holder_spk["addresses"],
+        json!([Address::from_script(&holder, false)
+            .unwrap()
+            .encode("bchreg")
+            .unwrap()])
+    );
+    assert!(mint_verbose["vout"][0]["tokenData"].is_object());
     assert_eq!(
         w.call(
             "blockchain.transaction.get_height",
@@ -404,6 +439,15 @@ async fn electrum_answers_match_bchd() {
         .as_array()
         .unwrap()
         .contains(&sent));
+    // Its signature shows its hash type, as BCHN decodes it.
+    let signed = w
+        .call("blockchain.transaction.get", json!([sent, true]))
+        .await;
+    let asm = signed["vin"][0]["scriptSig"]["asm"].as_str().unwrap();
+    assert!(
+        asm.ends_with(&format!("[ALL|FORKID] {}", hex::encode(&key.pubkey))),
+        "{asm}"
+    );
     let bad = w
         .reply(
             "blockchain.transaction.broadcast",
@@ -415,15 +459,22 @@ async fn electrum_answers_match_bchd() {
         .unwrap()
         .contains("rejected"));
 
-    // Not yet: RPA and double-spend proofs; fees from what the client sees.
+    // This bchd serves no input prefix filters: an RPA search cannot be
+    // answered (rpa_and_dsproof_methods runs against one that does). No proof is
+    // known for a transaction nobody double-spent. Fees from what the client sees.
     let rpa = w
         .reply("blockchain.rpa.get_history", json!(["ab", 0]))
         .await;
-    assert_eq!(rpa["error"]["code"], json!(-32601));
+    assert!(
+        rpa["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("input prefix filters")),
+        "a search of blocks without their filters is an error, not nothing found: {rpa}"
+    );
     let dsp = w
-        .reply("blockchain.transaction.dsproof.get", json!([sent]))
+        .call("blockchain.transaction.dsproof.get", json!([sent]))
         .await;
-    assert_eq!(dsp["error"]["code"], json!(-32601));
+    assert_eq!(dsp, Value::Null);
     let fee = w.call("blockchain.estimatefee", json!([2])).await;
     assert!(fee.as_f64().unwrap() >= 0.00001);
     assert!(w
@@ -434,4 +485,394 @@ async fn electrum_answers_match_bchd() {
         w.call("blockchain.relayfee", json!([])).await,
         json!(0.00001)
     );
+}
+
+fn rpa_value(outpoint: OutPoint, sequence: u32) -> u16 {
+    let mut b = outpoint.txid.0.to_vec();
+    b.extend_from_slice(&outpoint.vout.to_le_bytes());
+    b.extend_from_slice(&[0x02, 0x01, 0x51]);
+    b.extend_from_slice(&sequence.to_le_bytes());
+    let h = hash256(&b);
+    u16::from_be_bytes([h[0], h[1]])
+}
+
+/// A version 1 spend of a P2SH(OP_TRUE) coin whose input value is `prefix` (16 bits).
+fn ground_spend(outpoint: OutPoint, value: u64, prefix: u16, script: &[u8]) -> Vec<u8> {
+    let sequence = (0u32..)
+        .find(|s| rpa_value(outpoint, *s) == prefix)
+        .unwrap();
+    let mut tx = 1i32.to_le_bytes().to_vec();
+    tx.push(1);
+    tx.extend_from_slice(&outpoint.txid.0);
+    tx.extend_from_slice(&outpoint.vout.to_le_bytes());
+    tx.extend_from_slice(&[0x02, 0x01, 0x51]);
+    tx.extend_from_slice(&sequence.to_le_bytes());
+    tx.push(1);
+    tx.extend_from_slice(&(value - 3000).to_le_bytes());
+    tx.push(script.len() as u8);
+    tx.extend_from_slice(script);
+    tx.extend_from_slice(&0u32.to_le_bytes());
+    tx
+}
+
+/// RPA searches and double-spend proofs through the bridge, with Fulcrum's
+/// argument order, limits and result shapes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpa_and_dsproof_methods() {
+    let Some(bin) = bchd_rpa_or_skip() else {
+        return;
+    };
+    let node = Bchd::start_with(&bin, "bridge-rpa").await;
+    node.generate(110).await;
+    let mining = mining_script();
+    let key = Key::new(31);
+    let (cb1, v1) = node.coinbase(1).await;
+    let fund = TxSpec {
+        inputs: vec![(cb1, Unlock::Redeem(vec![0x51]))],
+        outputs: vec![
+            (500_000_000, key.script(), vec![]),
+            (v1 - 500_000_000 - 3000, mining.clone(), vec![]),
+        ],
+    }
+    .build();
+    node.send(&fund).await;
+    node.generate(1).await;
+
+    let port = free_port();
+    let log = std::fs::File::create(node.dir.join("bridge.log")).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_bch-electrum-bridge"))
+        .args([
+            "--network",
+            "regtest",
+            "--peer",
+            &node.peer(),
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .arg("--datadir")
+        .arg(node.dir.join("bridge-data"))
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("start bridge");
+    let _bridge = Bridge { child };
+    let mut w = Wallet::connect(port).await;
+    w.call("server.version", json!(["test-wallet", "1.5"]))
+        .await;
+    let features = w.call("server.features", json!([])).await;
+    assert_eq!(features["dsproof"], json!(true));
+    assert_eq!(features["rpa"]["prefix_bits_min"], json!(8));
+    assert_eq!(features["rpa"]["history_block_limit"], json!(60));
+    wait_bridge_tip(&mut w, 111).await;
+
+    // A payment ground to the prefix beef, seen first in the mempool.
+    let (cb2, v2) = node.coinbase(2).await;
+    let pay = ground_spend(cb2, v2, 0xbeef, &mining);
+    let pay_id = node.send(&pay).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let pending = w.call("blockchain.rpa.get_mempool", json!(["beef"])).await;
+        if pending
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["tx_hash"] == json!(pay_id))
+        {
+            assert_eq!(pending[0]["height"], json!(0));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the payment did not reach the mempool copy"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    node.generate(1).await;
+    wait_bridge_tip(&mut w, 112).await;
+    let rows = w
+        .call("blockchain.rpa.get_history", json!(["beef", 100]))
+        .await;
+    assert_eq!(rows, json!([{"tx_hash": pay_id, "height": 112}]));
+    // 8 bits of the same prefix find it too; another 16-bit prefix does not.
+    let rows8 = w
+        .call("blockchain.rpa.get_history", json!(["be", 100, 113]))
+        .await;
+    assert!(rows8
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["tx_hash"] == json!(pay_id)));
+    assert_eq!(
+        w.call("blockchain.rpa.get_history", json!(["beee", 100]))
+            .await,
+        json!([])
+    );
+    // At most 60 blocks per call, from `from`: from 0 never reaches 112.
+    assert_eq!(
+        w.call("blockchain.rpa.get_history", json!(["beef", 0]))
+            .await,
+        json!([])
+    );
+    // A to_height at or below from_height: nothing.
+    assert_eq!(
+        w.call("blockchain.rpa.get_history", json!(["beef", 112, 112]))
+            .await,
+        json!([])
+    );
+    // The older form: (from, count, prefix).
+    let legacy = w
+        .call("blockchain.reusable.get_history", json!([110, 5, "beef"]))
+        .await;
+    assert_eq!(legacy, json!([{"tx_hash": pay_id, "height": 112}]));
+    // Fewer than 8 bits are refused.
+    let short = w
+        .reply("blockchain.rpa.get_history", json!(["b", 100]))
+        .await;
+    assert_eq!(short["error"]["code"], json!(-32602));
+
+    // A double spend: the proof reaches the subscriber.
+    let coin = OutPoint::new(txid_of(&fund), 0);
+    let first = TxSpec {
+        inputs: vec![(coin, Unlock::Sign(&key, 500_000_000))],
+        outputs: vec![(499_990_000, mining.clone(), vec![])],
+    }
+    .build();
+    let second = TxSpec {
+        inputs: vec![(coin, Unlock::Sign(&key, 500_000_000))],
+        outputs: vec![(499_980_000, p2sh32(&[0x57, 0x75, 0x51]), vec![])],
+    }
+    .build();
+    let first_id = node.send(&first).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let height = w
+            .call("blockchain.transaction.subscribe", json!([first_id]))
+            .await;
+        if height == json!(0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the first spend did not reach the mempool copy"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        w.call(
+            "blockchain.transaction.dsproof.subscribe",
+            json!([first_id])
+        )
+        .await,
+        Value::Null
+    );
+    assert!(node
+        .try_rpc("sendrawtransaction", json!([hex::encode(&second)]))
+        .await
+        .is_err());
+    let note = w
+        .notification("blockchain.transaction.dsproof.subscribe")
+        .await;
+    assert_eq!(note["params"][0], json!(first_id));
+    let proof = note["params"][1].clone();
+    assert_eq!(proof["txid"], json!(first_id));
+    assert_eq!(
+        proof["outpoint"],
+        json!({"txid": coin.txid.to_hex(), "vout": 0})
+    );
+    assert_eq!(proof["descendants"], json!([first_id]));
+    let theirs = node.rpc("getdsproof", json!([first_id])).await;
+    assert_eq!(proof["dspid"], theirs["dspid"]);
+    assert_eq!(
+        w.call("blockchain.transaction.dsproof.get", json!([first_id]))
+            .await,
+        proof
+    );
+    assert_eq!(
+        w.call(
+            "blockchain.transaction.dsproof.get",
+            json!([proof["dspid"]])
+        )
+        .await,
+        proof
+    );
+    assert_eq!(
+        w.call("blockchain.transaction.dsproof.list", json!([]))
+            .await,
+        json!([first_id])
+    );
+    // A child of the proved transaction: the proof concerns it too, and its
+    // subscriber hears so when it reaches the mempool, as from Fulcrum.
+    let child = TxSpec {
+        inputs: vec![(
+            OutPoint::new(txid_of(&first), 0),
+            Unlock::Redeem(vec![0x51]),
+        )],
+        outputs: vec![(499_980_000, mining.clone(), vec![])],
+    }
+    .build();
+    let child_id = txid_of(&child).to_hex();
+    assert_eq!(
+        w.call(
+            "blockchain.transaction.dsproof.subscribe",
+            json!([child_id])
+        )
+        .await,
+        Value::Null
+    );
+    node.send(&child).await;
+    let note = loop {
+        let note = w
+            .notification("blockchain.transaction.dsproof.subscribe")
+            .await;
+        if note["params"][0] == json!(child_id) {
+            break note;
+        }
+    };
+    assert_eq!(note["params"][1]["dspid"], proof["dspid"]);
+    assert_eq!(
+        note["params"][1]["descendants"],
+        json!([first_id, child_id])
+    );
+    // A block settles the double spend: both subscribers hear the proof went.
+    w.notifications.clear();
+    node.generate(1).await;
+    let mut gone = std::collections::BTreeSet::new();
+    while gone.len() < 2 {
+        let note = w
+            .notification("blockchain.transaction.dsproof.subscribe")
+            .await;
+        if note["params"][1].is_null() {
+            gone.insert(note["params"][0].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(
+        gone,
+        [first_id.clone(), child_id.clone()].into_iter().collect()
+    );
+    assert_eq!(
+        w.call("blockchain.transaction.dsproof.list", json!([]))
+            .await,
+        json!([])
+    );
+    let stats = w.call("light_client.stats", json!([])).await;
+    assert!(stats["block_bytes"].as_u64().unwrap() > 0);
+    let passthrough = w.reply("daemon.passthrough", json!([])).await;
+    assert_eq!(passthrough["error"]["code"], json!(-32601));
+    // Named, as Fulcrum takes them: still no node RPC, the code Fulcrum
+    // gives when passthrough is off. Elsewhere an object is a bad parameter.
+    let named = w
+        .reply(
+            "daemon.passthrough",
+            json!({"method": "getblockcount", "params": []}),
+        )
+        .await;
+    assert_eq!(named["error"]["code"], json!(-32601));
+    let object = w
+        .reply("blockchain.transaction.get", json!({"tx_hash": first_id}))
+        .await;
+    assert_eq!(object["error"]["code"], json!(-32602));
+    // What Fulcrum keeps of BCHN's getmempoolinfo.
+    let info = w.call("mempool.get_info", json!([])).await;
+    assert_eq!(
+        info,
+        json!({"mempoolminfee": 0.00001, "minrelaytxfee": 0.00001})
+    );
+}
+
+/// The bridge's own identity methods (light_client.bcmr.*, not Fulcrum's),
+/// against bchd with transaction keys: an authbase and one update that
+/// publishes a registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bcmr_extension_methods() {
+    let Some(bin) = bchd_txid_binary_or_skip() else {
+        return;
+    };
+    let node = Bchd::start_with(&bin, "bridge-bcmr").await;
+    node.generate(110).await;
+    let redeem = vec![0x57, 0x75, 0x51];
+    let identity = p2sh20(&redeem);
+    let (cb, value) = node.coinbase(1).await;
+    let authbase = TxSpec {
+        inputs: vec![(cb, Unlock::Redeem(vec![0x51]))],
+        outputs: vec![(value - 2000, identity.clone(), vec![])],
+    }
+    .build();
+    let authbase_id = node.send(&authbase).await;
+    node.generate(1).await;
+    let registry = br#"{"version":{"major":0,"minor":1,"patch":0}}"#.to_vec();
+    let mut publication = vec![0x6a, 0x04, b'B', b'C', b'M', b'R', 0x20];
+    publication.extend_from_slice(&sha256(&registry));
+    publication.push(11);
+    publication.extend_from_slice(b"example.com");
+    let update = TxSpec {
+        inputs: vec![(
+            OutPoint::new(bch_light_client::Txid::from_hex(&authbase_id).unwrap(), 0),
+            Unlock::Redeem(redeem.clone()),
+        )],
+        outputs: vec![
+            (value - 4000, identity.clone(), vec![]),
+            (0, publication, vec![]),
+        ],
+    }
+    .build();
+    let update_id = node.send(&update).await;
+    node.generate(1).await;
+
+    let port = free_port();
+    let log = std::fs::File::create(node.dir.join("bridge.log")).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_bch-electrum-bridge"))
+        .args(["--network", "regtest", "--no-rpa", "--peer", &node.peer()])
+        .args(["--listen", &format!("127.0.0.1:{port}")])
+        .arg("--datadir")
+        .arg(node.dir.join("bridge-data"))
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("start bridge");
+    let _bridge = Bridge { child };
+    let mut w = Wallet::connect(port).await;
+    w.call("server.version", json!(["test-wallet", "1.5"]))
+        .await;
+    wait_bridge_tip(&mut w, node.height().await).await;
+    let chain = w
+        .call("light_client.bcmr.resolve", json!([authbase_id]))
+        .await;
+    assert_eq!(chain["authhead"], json!(update_id));
+    assert_eq!(chain["height"], json!(112));
+    assert_eq!(chain["burned"], json!(false));
+    assert_eq!(chain["publication"]["uris"], json!(["example.com"]));
+    assert_eq!(
+        chain["publication"]["hash"],
+        json!(hex::encode(sha256(&registry)))
+    );
+    assert_eq!(
+        w.call(
+            "light_client.bcmr.verify_registry",
+            json!([hex::encode(&registry), chain["publication"]["hash"]])
+        )
+        .await,
+        json!(true)
+    );
+    assert_eq!(
+        w.call(
+            "light_client.bcmr.verify_registry",
+            json!(["00", chain["publication"]["hash"]])
+        )
+        .await,
+        json!(false)
+    );
+    let extended = w
+        .call(
+            "light_client.bcmr.resolve_extension",
+            json!([authbase_id, [hex::encode(&authbase)]]),
+        )
+        .await;
+    assert_eq!(extended["authhead"], json!(update_id));
+    let wrong = w
+        .reply(
+            "light_client.bcmr.resolve_extension",
+            json!([authbase_id, [hex::encode(&update)]]),
+        )
+        .await;
+    assert!(wrong["error"].is_object(), "{wrong}");
 }

@@ -16,13 +16,14 @@ use crate::p2p::message::{
     decode_cfcheckpt, decode_cfheaders, decode_cfilter, decode_feefilter, decode_headers,
     decode_inv, decode_reject, encode_getcf, encode_getcfcheckpt, encode_getheaders, encode_inv,
     Inv, INV_BLOCK, INV_TX, MAX_CFHEADERS_PER_MSG, MAX_CFILTERS_PER_MSG, MAX_HEADERS_PER_MSG,
+    NODE_BLOOM,
 };
 use crate::p2p::peer::{Peer, PeerEvent, PeerOptions, Step};
 use crate::p2p::pool::Pool;
 use crate::p2p::socks::{PeerAddr, Transport};
 use crate::params::Network;
 use crate::scan::{scan, ScanKey};
-use crate::tx::{OutPoint, TokenData, Transaction};
+use crate::tx::{OutPoint, TokenData, Transaction, TxOut};
 use rand::Rng;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -32,6 +33,16 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+
+mod dsproofs;
+mod filters;
+mod persist;
+mod rpa_search;
+mod tokens;
+pub use dsproofs::DsProofInfo;
+use filters::{store_base, FilterKind};
+pub use rpa_search::RpaMatch;
+pub use tokens::{balances_of, supply_of, Authchain, CategoryBalance, TokenHolding, TokenSupply};
 
 /// How the client reaches the network and how much it downloads.
 #[derive(Debug, Clone)]
@@ -62,6 +73,21 @@ pub struct Config {
     pub request_timeout: Duration,
     pub block_cache_bytes: usize,
     pub mempool_max_bytes: usize,
+    /// The wallet's birthday: filters are kept, and histories read, from the
+    /// filter checkpoint at or below this height (0: from genesis).
+    pub filters_from_height: u32,
+    /// Keep input prefix filters (type 2) for reusable payment addresses.
+    pub rpa_filters: bool,
+    /// Where input prefix filters start; by default the network's usual RPA
+    /// start height, or the birthday when that is later.
+    pub rpa_from_height: Option<u32>,
+    /// Random other prefixes whose blocks an RPA search also downloads, so
+    /// a peer that sees the downloads cannot tell which prefix is the wallet's.
+    pub rpa_cover_prefixes: usize,
+    /// Look up peers from the network's DNS seeds (not through a proxy).
+    pub dns_seeds: bool,
+    /// Learn peers from the addresses connected peers announce.
+    pub learn_peers: bool,
 }
 
 impl Config {
@@ -81,6 +107,12 @@ impl Config {
             request_timeout: Duration::from_secs(60),
             block_cache_bytes: 64 << 20,
             mempool_max_bytes: 256 << 20,
+            filters_from_height: 0,
+            rpa_filters: false,
+            rpa_from_height: None,
+            rpa_cover_prefixes: 0,
+            dns_seeds: false,
+            learn_peers: true,
         }
     }
 }
@@ -102,6 +134,11 @@ pub enum Event {
     MempoolTx { txid: Txid },
     /// A watched target's history, confirmed or unconfirmed, changed.
     TargetChanged { target: Target },
+    /// The double-spend proof `id` concerns this mempool transaction: it
+    /// arrived and was checked, the transaction joined the descendants of
+    /// the one it proves, or a block settled the double spend and the
+    /// proof went.
+    DoubleSpendProof { txid: Txid, id: [u8; 32] },
 }
 
 /// Where the client stands.
@@ -115,6 +152,17 @@ pub struct Status {
     pub synced: bool,
     /// Whether the peers' filters hold transaction keys, once a block has shown it.
     pub txid_keys: Option<bool>,
+    /// The highest height with an input prefix filter, when they are kept.
+    pub rpa_height: Option<u32>,
+}
+
+/// What the client has downloaded since it started, in bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub headers: u64,
+    pub filters: u64,
+    pub blocks: u64,
+    pub blocks_downloaded: u64,
 }
 
 /// A target's transaction in the mempool.
@@ -242,6 +290,19 @@ pub struct MempoolSummary {
 
 /// The default relay fee of Bitcoin Cash nodes, satoshis per 1000 bytes.
 const DEFAULT_RELAY_FEE: u64 = 1000;
+/// The highest relay fee a peer's feefilter may make the client ask.
+const MAX_RELAY_FEE: u64 = 10 * DEFAULT_RELAY_FEE;
+
+/// The relay fee from the feefilters of the connected peers: their median,
+/// so that one peer cannot raise it alone, and at most MAX_RELAY_FEE; the
+/// default when none sent one.
+fn relay_fee(mut fees: Vec<u64>) -> u64 {
+    fees.sort_unstable();
+    fees.get(fees.len() / 2)
+        .copied()
+        .unwrap_or(DEFAULT_RELAY_FEE)
+        .clamp(1, MAX_RELAY_FEE)
+}
 const CHECKPOINT_INTERVAL: u32 = 1000;
 const LIVE_WINDOW: u32 = 12;
 const RECENT_BLOCKS: usize = 24;
@@ -251,11 +312,19 @@ struct SyncState {
     synced: bool,
     header_tip: u32,
     filter_tip: Option<u32>,
+    rpa_tip: Option<u32>,
+}
+
+/// What the client has downloaded.
+#[derive(Default)]
+struct Counters {
+    header_bytes: AtomicU64,
+    filter_bytes: AtomicU64,
 }
 
 #[derive(Default)]
 struct Recent {
-    outputs: HashMap<OutPoint, u64>,
+    outputs: HashMap<OutPoint, TxOut>,
     blocks: VecDeque<Vec<OutPoint>>,
     fee_rates: VecDeque<u64>,
 }
@@ -266,6 +335,19 @@ struct Inner {
     fetcher: BlockFetcher,
     chain: RwLock<HeaderChain>,
     filters: RwLock<FilterStore>,
+    rpa_filters: Option<RwLock<FilterStore>>,
+    stats: Counters,
+    dsproofs: Mutex<dsproofs::DsProofs>,
+    served: Mutex<filters::Served>,
+    /// Which filter types (script, input prefix) each connection serves, once asked.
+    filter_types: Mutex<HashMap<u64, [Option<bool>; 2]>>,
+    /// The latest identity transaction (and its height) found for each
+    /// authbase resolved: the wallet's own records.
+    identities: Mutex<HashMap<Txid, (Txid, u32)>>,
+    /// The background tasks, for LightClient::stop to wait for.
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// The network's data folder.
+    dir: PathBuf,
     generation: AtomicU64,
     targets: Mutex<HashMap<FilterKey, TargetState>>,
     mempool: RwLock<Mempool>,
@@ -280,6 +362,10 @@ struct Inner {
     live_tip: Mutex<Option<u32>>,
     /// The tip last announced with `Event::Tip`.
     announced_tip: Mutex<Option<(u32, BlockHash)>>,
+    /// The last block a peer announced that the chain did not have, and
+    /// when: a relay peer may announce a block before the nodes that serve
+    /// filters have it, and they may never announce it.
+    announced_block: Mutex<Option<(BlockHash, std::time::Instant)>>,
     requested: Mutex<HashSet<Txid>>,
     shutdown: watch::Sender<bool>,
 }
@@ -298,8 +384,11 @@ impl LightClient {
     /// Opens the stores and starts connecting and syncing in the background.
     pub async fn start(config: Config) -> Result<LightClient> {
         let params = config.network.params();
-        if config.peers.is_empty() {
-            return Err(Error::new(ErrorKind::InvalidInput, "no peers given"));
+        if config.peers.is_empty() && !config.dns_seeds {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "no peers given and no DNS seeds allowed",
+            ));
         }
         let peers = config
             .peers
@@ -319,8 +408,20 @@ impl LightClient {
         std::fs::create_dir_all(&dir).map_err(|e| storage_error("data folder", e))?;
         let chain = HeaderChain::open(&dir.join("headers.dat"), params)
             .map_err(|e| storage_error("headers", e))?;
-        let filters = FilterStore::open(&dir, |h| chain.hash_at(h))
+        let birthday = config.filters_from_height;
+        let filters = FilterStore::open(&dir, "", store_base(birthday), |h| chain.hash_at(h))
             .map_err(|e| storage_error("filters", e))?;
+        let rpa_filters = if config.rpa_filters {
+            let from = config
+                .rpa_from_height
+                .unwrap_or(params.rpa_start_height.max(birthday));
+            Some(RwLock::new(
+                FilterStore::open(&dir, "rpa-", store_base(from), |h| chain.hash_at(h))
+                    .map_err(|e| storage_error("input prefix filters", e))?,
+            ))
+        } else {
+            None
+        };
         info!(
             network = params.name,
             headers = chain.tip_height(),
@@ -338,7 +439,15 @@ impl LightClient {
             transport,
             connect_timeout: config.request_timeout.min(Duration::from_secs(30)),
         };
-        let (pool, peer_events) = Pool::new(peers, options, config.service_peers);
+        let (pool, peer_events) =
+            Pool::new(peers, options, config.service_peers, config.learn_peers);
+        // DNS lookups would go around a proxy, so they are skipped behind one.
+        if config.dns_seeds && config.proxy.is_none() {
+            let seeding = pool.clone();
+            tokio::spawn(async move {
+                seeding.seed(params.dns_seeds, params.default_port).await;
+            });
+        }
         let fetcher = BlockFetcher::new(
             pool.clone(),
             isolate,
@@ -348,15 +457,27 @@ impl LightClient {
         );
         let (shutdown, _) = watch::channel(false);
         let (events, _) = broadcast::channel(4096);
+        let watched = persist::load(&dir, &chain);
         let filter_tip = filters.tip();
+        let rpa_tip = rpa_filters
+            .as_ref()
+            .and_then(|s| s.read().expect("filters lock").tip());
         let header_tip = chain.tip_height();
         let inner = Arc::new(Inner {
             pool,
             fetcher,
             chain: RwLock::new(chain),
             filters: RwLock::new(filters),
+            rpa_filters,
+            stats: Counters::default(),
+            dsproofs: Mutex::new(dsproofs::DsProofs::default()),
+            served: Mutex::new(filters::Served::default()),
+            filter_types: Mutex::new(HashMap::new()),
+            identities: Mutex::new(tokens::load_identities(&dir)),
+            tasks: Mutex::new(Vec::new()),
+            dir: dir.clone(),
             generation: AtomicU64::new(0),
-            targets: Mutex::new(HashMap::new()),
+            targets: Mutex::new(watched),
             mempool: RwLock::new(Mempool::new(config.mempool_max_bytes)),
             recent: Mutex::new(Recent::default()),
             peer_fees: Mutex::new(HashMap::new()),
@@ -365,6 +486,7 @@ impl LightClient {
                 synced: false,
                 header_tip,
                 filter_tip,
+                rpa_tip,
             })
             .0,
             wake: Notify::new(),
@@ -373,13 +495,17 @@ impl LightClient {
             txid_keys: Mutex::new(None),
             live_tip: Mutex::new(None),
             announced_tip: Mutex::new(None),
+            announced_block: Mutex::new(None),
             requested: Mutex::new(HashSet::new()),
             shutdown,
             config,
         });
-        inner.pool.spawn_maintainer(inner.shutdown.subscribe());
-        tokio::spawn(event_loop(inner.clone(), peer_events));
-        tokio::spawn(sync_loop(inner.clone()));
+        let tasks = vec![
+            inner.pool.spawn_maintainer(inner.shutdown.subscribe()),
+            tokio::spawn(event_loop(inner.clone(), peer_events)),
+            tokio::spawn(sync_loop(inner.clone())),
+        ];
+        *inner.tasks.lock().expect("tasks lock") = tasks;
         Ok(LightClient { inner })
     }
 
@@ -387,6 +513,18 @@ impl LightClient {
     pub fn shutdown(&self) {
         let _ = self.inner.shutdown.send(true);
         self.inner.wake.notify_waiters();
+    }
+
+    /// Stops the background tasks, as [`LightClient::shutdown`] does, and
+    /// returns once they have ended and the connections are closed: the
+    /// data folder may then be opened again.
+    pub async fn stop(&self) {
+        self.shutdown();
+        let tasks: Vec<JoinHandle<()>> =
+            std::mem::take(&mut *self.inner.tasks.lock().expect("tasks lock"));
+        for task in tasks {
+            let _ = task.await;
+        }
     }
 
     /// Changes as they happen. A receiver that falls behind gets `Lagged`
@@ -404,6 +542,18 @@ impl LightClient {
             peers: self.inner.pool.peers().len(),
             synced: state.synced,
             txid_keys: *self.inner.txid_keys.lock().expect("lock"),
+            rpa_height: state.rpa_tip,
+        }
+    }
+
+    /// Bytes downloaded since the client started.
+    pub fn stats(&self) -> Stats {
+        let (blocks, blocks_downloaded) = self.inner.fetcher.downloaded();
+        Stats {
+            headers: self.inner.stats.header_bytes.load(Ordering::Relaxed),
+            filters: self.inner.stats.filter_bytes.load(Ordering::Relaxed),
+            blocks,
+            blocks_downloaded,
         }
     }
 
@@ -468,7 +618,8 @@ impl LightClient {
             .collect();
         drop(chain);
         let branch = merkle_branch(&leaves, height as usize);
-        let root = crate::block::merkle_fold(leaves[height as usize], height as usize, &branch);
+        let root = crate::block::merkle_fold(leaves[height as usize], height as usize, &branch)
+            .expect("a position of the chain is a true one");
         Ok((branch, root))
     }
 
@@ -489,12 +640,17 @@ impl LightClient {
 
     /// Stops watching; returns whether the target was watched.
     pub fn unwatch(&self, target: &Target) -> bool {
-        self.inner
+        let removed = self
+            .inner
             .targets
             .lock()
             .expect("targets lock")
             .remove(&target.key())
-            .is_some()
+            .is_some();
+        if removed {
+            persist::save(&self.inner);
+        }
+        removed
     }
 
     /// The watched targets.
@@ -524,19 +680,56 @@ impl LightClient {
         }
     }
 
-    /// A target's confirmed and unconfirmed history.
+    /// A target's confirmed and unconfirmed history. A mempool transaction's
+    /// fee is there when the client holds the value of every output it
+    /// spends (see [`LightClient::mempool_fee`]), and left out otherwise.
     pub async fn history(&self, target: &Target) -> Result<History> {
         self.ready(target).await?;
-        let states = self.inner.targets.lock().expect("targets lock");
-        let state = states
-            .get(&target.key())
-            .ok_or_else(|| Error::new(ErrorKind::Stopped, "target removed"))?;
-        let mempool = self.inner.mempool.read().expect("mempool lock");
-        Ok(History {
-            synced_height: state.synced_to,
-            confirmed: state.txs.clone(),
-            mempool: mempool_entries(state, &mempool),
-        })
+        let mut history = {
+            let states = self.inner.targets.lock().expect("targets lock");
+            let state = states
+                .get(&target.key())
+                .ok_or_else(|| Error::new(ErrorKind::Stopped, "target removed"))?;
+            let mempool = self.inner.mempool.read().expect("mempool lock");
+            History {
+                synced_height: state.synced_to,
+                confirmed: state.txs.clone(),
+                mempool: mempool_entries(state, &mempool),
+            }
+        };
+        for entry in history.mempool.iter_mut().filter(|e| e.fee.is_none()) {
+            entry.fee = self.mempool_fee(entry.txid);
+        }
+        Ok(history)
+    }
+
+    /// The fee of a mempool transaction, from what the client holds: the
+    /// value of each output it spends must be that of another mempool
+    /// transaction, of the last blocks, or of a watched coin. Nothing is
+    /// downloaded to learn it: fetching the block of an input would show a
+    /// peer which payment the wallet looks at. None when a value is not
+    /// held; a fee found is kept.
+    pub fn mempool_fee(&self, txid: Txid) -> Option<u64> {
+        let entry = self
+            .inner
+            .mempool
+            .read()
+            .expect("mempool lock")
+            .get(&txid)?;
+        if entry.fee.is_some() {
+            return entry.fee;
+        }
+        let mut inputs = 0u64;
+        for input in &entry.tx.inputs {
+            inputs = inputs.checked_add(known_value(&self.inner, &input.prevout)?)?;
+        }
+        let fee = inputs.checked_sub(entry.tx.outputs.iter().map(|o| o.value).sum())?;
+        self.inner
+            .mempool
+            .write()
+            .expect("mempool lock")
+            .set_fee(&txid, fee);
+        Some(fee)
     }
 
     pub async fn balance(&self, target: &Target, tokens: TokenFilter) -> Result<Balance> {
@@ -767,66 +960,47 @@ impl LightClient {
                 .await
                 .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no peer connected"))?
         };
+        // Taken in when the peer gives it back when asked, or when another
+        // node announces it: BCHN gives back only transactions it announced
+        // to the asker, never to the peer it got one from. One the mempool
+        // copy holds already was relayed to the client, so it is taken in.
+        let mut events = inner.events.subscribe();
+        let held = self.in_mempool(&txid);
         peer.send("tx", raw.to_vec());
-        let answer = peer
-            .request(
-                "getdata",
-                encode_inv(&[Inv::tx(txid)]),
-                inner.config.request_timeout,
-                move |m| match m.command.as_str() {
-                    "tx" if sha256d(&m.payload) == txid.0 => Step::Done,
-                    "notfound" => match decode_inv(&m.payload) {
-                        Ok(items) if items.iter().any(|i| i.hash == txid.0) => Step::Done,
-                        _ => Step::Skip,
-                    },
-                    "reject" => match decode_reject(&m.payload) {
-                        Ok(r) if r.hash == Some(txid.0) => Step::Done,
-                        _ => Step::Skip,
-                    },
-                    _ => Step::Skip,
-                },
-            )
-            .await;
+        let announced = async {
+            loop {
+                match events.recv().await {
+                    Ok(Event::MempoolTx { txid: t }) if t == txid => return,
+                    Err(broadcast::error::RecvError::Closed) => std::future::pending().await,
+                    _ => {}
+                }
+            }
+        };
+        let accepted = if held {
+            Ok(())
+        } else {
+            tokio::select! {
+                result = accepted_by(&peer, txid, inner.config.request_timeout) => result,
+                () = announced => Ok(()),
+            }
+        };
         if isolate {
             peer.close();
         }
-        let message = answer?
-            .pop()
-            .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no answer"))?;
-        match message.command.as_str() {
-            "tx" => {
-                on_mempool_tx(inner, tx);
-                Ok(txid)
-            }
-            "reject" => {
-                let reason = decode_reject(&message.payload)
-                    .map(|r| r.reason)
-                    .unwrap_or_default();
-                Err(Error::new(
-                    ErrorKind::Rejected,
-                    format!("the transaction was rejected: {reason}"),
-                ))
-            }
-            _ => Err(Error::new(
-                ErrorKind::Rejected,
-                "the peer did not accept the transaction",
-            )),
-        }
+        accepted?;
+        on_mempool_tx(inner, tx);
+        Ok(txid)
     }
 
     // ---- fees and mempool
 
     pub fn fee_estimate(&self) -> FeeEstimate {
-        let relay = self
-            .inner
-            .peer_fees
-            .lock()
-            .expect("fees lock")
-            .values()
-            .copied()
-            .max()
-            .unwrap_or(DEFAULT_RELAY_FEE)
-            .max(1);
+        let relay = {
+            let live: HashSet<u64> = self.inner.pool.peers().iter().map(|p| p.id).collect();
+            let mut fees = self.inner.peer_fees.lock().expect("fees lock");
+            fees.retain(|peer, _| live.contains(peer));
+            relay_fee(fees.values().copied().collect())
+        };
         let mut rates: Vec<u64> = self
             .inner
             .recent
@@ -889,6 +1063,64 @@ impl Inner {
     }
 }
 
+/// How long a broadcast waits for the peer to take the transaction in.
+const BROADCAST_WINDOW: Duration = Duration::from_secs(20);
+
+/// Waits until `peer`, which was just sent `txid`, has it in its mempool:
+/// it is asked for the transaction until it gives it. A node may check a
+/// transaction after it answers the next message (kth admits transactions
+/// in a task of its own), so `notfound` is asked again, more slowly each
+/// time, until a reject or the end of the window.
+async fn accepted_by(peer: &Peer, txid: Txid, timeout: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout.min(BROADCAST_WINDOW);
+    let mut pause = Duration::from_millis(50);
+    loop {
+        let answer = peer
+            .request(
+                "getdata",
+                encode_inv(&[Inv::tx(txid)]),
+                timeout,
+                move |m| match m.command.as_str() {
+                    "tx" if sha256d(&m.payload) == txid.0 => Step::Done,
+                    "notfound" => match decode_inv(&m.payload) {
+                        Ok(items) if items.iter().any(|i| i.hash == txid.0) => Step::Done,
+                        _ => Step::Skip,
+                    },
+                    "reject" => match decode_reject(&m.payload) {
+                        Ok(r) if r.hash == Some(txid.0) => Step::Done,
+                        _ => Step::Skip,
+                    },
+                    _ => Step::Skip,
+                },
+            )
+            .await?
+            .pop()
+            .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no answer"))?;
+        match answer.command.as_str() {
+            "tx" => return Ok(()),
+            "reject" => {
+                let reason = decode_reject(&answer.payload)
+                    .map(|r| r.reason)
+                    .unwrap_or_default();
+                return Err(Error::new(
+                    ErrorKind::Rejected,
+                    format!("the transaction was rejected: {reason}"),
+                ));
+            }
+            _ if tokio::time::Instant::now() + pause < deadline => {
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(Duration::from_secs(2));
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::Rejected,
+                    "the peer did not accept the transaction",
+                ))
+            }
+        }
+    }
+}
+
 /// The mempool transactions that pay a target or spend its outputs.
 fn mempool_entries(state: &TargetState, mempool: &Mempool) -> Vec<MempoolEntry> {
     let mut owned: HashMap<OutPoint, (u64, Option<TokenData>)> = HashMap::new();
@@ -938,6 +1170,34 @@ fn mempool_entries(state: &TargetState, mempool: &Mempool) -> Vec<MempoolEntry> 
     out
 }
 
+/// The value of an output the client knows without a lookup: of a mempool
+/// transaction, of the last blocks, or a watched coin.
+fn known_value(inner: &Inner, outpoint: &OutPoint) -> Option<u64> {
+    if let Some(value) = inner
+        .mempool
+        .read()
+        .expect("mempool lock")
+        .output_value(outpoint)
+    {
+        return Some(value);
+    }
+    if let Some(output) = inner
+        .recent
+        .lock()
+        .expect("recent lock")
+        .outputs
+        .get(outpoint)
+    {
+        return Some(output.value);
+    }
+    inner
+        .targets
+        .lock()
+        .expect("targets lock")
+        .values()
+        .find_map(|s| s.coins.get(outpoint).map(|c| c.value))
+}
+
 fn new_entry(entry: &crate::mempool::MempoolTx, mempool: &Mempool) -> MempoolEntry {
     MempoolEntry {
         txid: entry.tx.txid(),
@@ -963,10 +1223,12 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
                 let Ok(items) = decode_inv(&message.payload) else {
                     continue;
                 };
-                if items.iter().any(|i| i.kind == INV_BLOCK) {
+                if let Some(block) = items.iter().rev().find(|i| i.kind == INV_BLOCK) {
+                    note_announced(&inner, BlockHash(block.hash));
                     inner.wake.notify_one();
                 }
-                let wanted: Vec<Inv> = {
+                let mut wanted: Vec<Inv> = dsproofs::wanted(&inner, &items);
+                wanted.extend({
                     let mempool = inner.mempool.read().expect("mempool lock");
                     let mut requested = inner.requested.lock().expect("requested lock");
                     if requested.len() > 100_000 {
@@ -979,8 +1241,8 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
                             !mempool.contains(&Txid(i.hash)) && requested.insert(Txid(i.hash))
                         })
                         .copied()
-                        .collect()
-                };
+                        .collect::<Vec<Inv>>()
+                });
                 // Every announced transaction is fetched: what is asked for says nothing.
                 if !wanted.is_empty() {
                     if let Some(p) = inner.pool.peers().into_iter().find(|p| p.id == peer) {
@@ -988,7 +1250,24 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
                     }
                 }
             }
-            "headers" => inner.wake.notify_one(),
+            "headers" => {
+                if let Some(last) = decode_headers(&message.payload)
+                    .ok()
+                    .and_then(|headers| headers.last().map(|(_, header)| header.hash()))
+                {
+                    note_announced(&inner, last);
+                }
+                inner.wake.notify_one();
+            }
+            crate::dsproof::COMMAND => dsproofs::on_relayed(&inner, message.payload),
+            "addr" if inner.config.learn_peers => {
+                if let Ok(addrs) = crate::p2p::pool::decode_addr(&message.payload) {
+                    let learned = inner.pool.learn_from(peer, addrs);
+                    if learned > 0 {
+                        debug!(learned, "addresses from a peer");
+                    }
+                }
+            }
             "tx" => {
                 if let Ok(tx) = Transaction::from_bytes(&message.payload) {
                     inner
@@ -1014,14 +1293,14 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
 }
 
 /// Adds a relayed transaction to the mempool copy and tells which watched targets it touches.
-fn on_mempool_tx(inner: &Inner, tx: Transaction) {
+fn on_mempool_tx(inner: &Arc<Inner>, tx: Transaction) {
     let txid = tx.txid();
     let touched: Vec<Target> = {
         let states = inner.targets.lock().expect("targets lock");
         let recent = inner.recent.lock().expect("recent lock");
         let mut mempool = inner.mempool.write().expect("mempool lock");
         let known = |o: &OutPoint| {
-            recent.outputs.get(o).copied().or_else(|| {
+            recent.outputs.get(o).map(|o| o.value).or_else(|| {
                 states
                     .values()
                     .find_map(|s| s.coins.get(o).map(|c| c.value))
@@ -1059,6 +1338,47 @@ fn on_mempool_tx(inner: &Inner, tx: Transaction) {
     for target in touched {
         inner.emit(Event::TargetChanged { target });
     }
+    dsproofs::on_descendant(inner, &tx);
+    dsproofs::on_mempool_tx(inner, &tx);
+}
+
+/// How long the sync loop waits for a wake-up before a round of its own.
+const SYNC_PAUSE: Duration = Duration::from_secs(30);
+/// While a block a peer announced is not in the chain, the nodes that serve
+/// filters are asked for headers this often, for at most ANNOUNCED_FOR.
+const ANNOUNCED_RETRY: Duration = Duration::from_secs(1);
+const ANNOUNCED_FOR: Duration = Duration::from_secs(60);
+
+/// Notes a block a peer announced, when the chain does not have it.
+fn note_announced(inner: &Inner, hash: BlockHash) {
+    if inner
+        .chain
+        .read()
+        .expect("chain lock")
+        .height_of(&hash)
+        .is_none()
+    {
+        *inner.announced_block.lock().expect("announced lock") =
+            Some((hash, std::time::Instant::now()));
+    }
+}
+
+/// Whether a block a peer announced lately is still not in the chain.
+fn awaiting_announced(inner: &Inner) -> bool {
+    let mut announced = inner.announced_block.lock().expect("announced lock");
+    let awaiting = announced.is_some_and(|(hash, since)| {
+        since.elapsed() < ANNOUNCED_FOR
+            && inner
+                .chain
+                .read()
+                .expect("chain lock")
+                .height_of(&hash)
+                .is_none()
+    });
+    if !awaiting {
+        *announced = None;
+    }
+    awaiting
 }
 
 async fn sync_loop(inner: Arc<Inner>) {
@@ -1067,13 +1387,23 @@ async fn sync_loop(inner: Arc<Inner>) {
         if *shutdown.borrow() {
             break;
         }
-        if let Err(e) = sync_once(&inner).await {
+        // A round stops where it waits when the client stops.
+        let round = tokio::select! {
+            result = sync_once(&inner) => result,
+            _ = shutdown.changed() => break,
+        };
+        if let Err(e) = round {
             warn!(error = %e, "sync round failed");
             inner.state.send_modify(|s| s.synced = false);
         }
+        let pause = if awaiting_announced(&inner) {
+            ANNOUNCED_RETRY
+        } else {
+            SYNC_PAUSE
+        };
         tokio::select! {
             _ = inner.wake.notified() => {}
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            _ = tokio::time::sleep(pause) => {}
             _ = shutdown.changed() => {}
         }
     }
@@ -1081,13 +1411,20 @@ async fn sync_loop(inner: Arc<Inner>) {
 
 async fn sync_once(inner: &Arc<Inner>) -> Result<()> {
     let _guard = inner.sync_lock.lock().await;
+    // Headers from a node that serves filters: it has the blocks whose
+    // filters are asked for next. A relay node may be a block ahead of it,
+    // and a filter request for a block the node does not have yet waits out
+    // the timeout.
     let peer = inner
         .pool
-        .wait_peer(inner.config.request_timeout)
+        .wait_filter_peer(inner.config.request_timeout)
         .await
-        .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no peer connected"))?;
+        .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no peer that serves filters"))?;
     sync_headers(inner, &peer).await?;
-    sync_filters(inner).await?;
+    filters::sync(inner, FilterKind::Script).await?;
+    if let Err(e) = filters::sync(inner, FilterKind::Rpa).await {
+        warn!(error = %e, "input prefix filters not synced");
+    }
     follow_tip(inner).await?;
     let (header_tip, filter_tip) = {
         let chain = inner.chain.read().expect("chain lock");
@@ -1149,6 +1486,10 @@ async fn sync_headers(inner: &Arc<Inner>, peer: &Peer) -> Result<()> {
                 },
             )
             .await?;
+        inner
+            .stats
+            .header_bytes
+            .fetch_add(reply[0].payload.len() as u64, Ordering::Relaxed);
         let headers = decode_headers(&reply[0].payload)
             .map_err(|e| Error::with_source(ErrorKind::InvalidData, "headers message", e))?;
         let full = headers.len() == MAX_HEADERS_PER_MSG;
@@ -1191,12 +1532,39 @@ async fn sync_headers(inner: &Arc<Inner>, peer: &Peer) -> Result<()> {
 
 fn on_reorg(inner: &Arc<Inner>, fork: u32) -> Result<()> {
     warn!(fork, "chain reorganization");
-    inner
-        .filters
-        .write()
-        .expect("filters lock")
-        .truncate(fork + 1)
-        .map_err(|e| storage_error("filters", e))?;
+    // The blocks that leave the chain, while the filter store still names them.
+    let disconnected: Vec<Arc<Block>> = {
+        let store = inner.filters.read().expect("filters lock");
+        (fork + 1..store.next_height())
+            .filter_map(|h| store.block_hash(h))
+            .filter_map(|hash| inner.fetcher.cached(&hash))
+            .collect()
+    };
+    for kind in [FilterKind::Script, FilterKind::Rpa] {
+        if let Some(store) = inner.store(kind) {
+            store
+                .write()
+                .expect("filters lock")
+                .truncate_from(fork + 1)
+                .map_err(|e| storage_error("filters", e))?;
+            filters::forget_served(inner, kind, fork + 1);
+        }
+    }
+    // Their transactions go back to the mempool copy, as nodes put them
+    // back in theirs, except those that spend a disconnected coinbase.
+    let mut gone: HashSet<Txid> = disconnected
+        .iter()
+        .filter_map(|b| b.txs.first().map(|t| t.txid()))
+        .collect();
+    for block in &disconnected {
+        for tx in block.txs.iter().skip(1) {
+            if tx.inputs.iter().any(|i| gone.contains(&i.prevout.txid)) {
+                gone.insert(tx.txid());
+                continue;
+            }
+            on_mempool_tx(inner, tx.clone());
+        }
+    }
     let changed: Vec<Target> = {
         let mut states = inner.targets.lock().expect("targets lock");
         states
@@ -1210,252 +1578,14 @@ fn on_reorg(inner: &Arc<Inner>, fork: u32) -> Result<()> {
     }
     inner.state.send_modify(|s| {
         s.filter_tip = s.filter_tip.map(|t| t.min(fork));
+        s.rpa_tip = s.rpa_tip.map(|t| t.min(fork));
         s.synced = false;
     });
     inner.emit(Event::Reorg { fork_height: fork });
     for target in changed {
         inner.emit(Event::TargetChanged { target });
     }
-    Ok(())
-}
-
-struct FilterBatch {
-    start: u32,
-    hashes: Vec<BlockHash>,
-    prev_header: [u8; 32],
-    filter_hashes: Vec<[u8; 32]>,
-    filters: Vec<Vec<u8>>,
-}
-
-async fn fetch_filter_batch(
-    peer: Arc<Peer>,
-    start: u32,
-    hashes: Vec<BlockHash>,
-    timeout: Duration,
-) -> Result<FilterBatch> {
-    let stop = *hashes.last().expect("non-empty batch");
-    let reply = peer
-        .request(
-            "getcfheaders",
-            encode_getcf(SCRIPT_FILTER_TYPE, start, stop),
-            timeout,
-            move |m| match decode_cfheaders(&m.payload) {
-                Ok(h)
-                    if m.command == "cfheaders"
-                        && h.filter_type == SCRIPT_FILTER_TYPE
-                        && h.stop == stop =>
-                {
-                    Step::Done
-                }
-                _ => Step::Skip,
-            },
-        )
-        .await?;
-    let cfheaders = decode_cfheaders(&reply[0].payload)
-        .map_err(|e| Error::with_source(ErrorKind::InvalidData, "cfheaders", e))?;
-    if cfheaders.filter_hashes.len() != hashes.len() {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("cfheaders from {start} has the wrong count"),
-        ));
-    }
-    let mut filters: Vec<Vec<u8>> = Vec::with_capacity(hashes.len());
-    for (i, chunk) in hashes.chunks(MAX_CFILTERS_PER_MSG).enumerate() {
-        let chunk_start = start + (i * MAX_CFILTERS_PER_MSG) as u32;
-        let wanted: HashSet<BlockHash> = chunk.iter().copied().collect();
-        let mut remaining = chunk.len();
-        let reply = peer
-            .request(
-                "getcfilters",
-                encode_getcf(
-                    SCRIPT_FILTER_TYPE,
-                    chunk_start,
-                    *chunk.last().expect("non-empty"),
-                ),
-                timeout,
-                move |m| {
-                    if m.command != "cfilter" {
-                        return Step::Skip;
-                    }
-                    match decode_cfilter(&m.payload) {
-                        Ok(f)
-                            if f.filter_type == SCRIPT_FILTER_TYPE && wanted.contains(&f.block) =>
-                        {
-                            remaining -= 1;
-                            if remaining == 0 {
-                                Step::Done
-                            } else {
-                                Step::More
-                            }
-                        }
-                        _ => Step::Skip,
-                    }
-                },
-            )
-            .await?;
-        for (j, message) in reply.iter().enumerate() {
-            let f = decode_cfilter(&message.payload)
-                .map_err(|e| Error::with_source(ErrorKind::InvalidData, "cfilter", e))?;
-            let index = i * MAX_CFILTERS_PER_MSG + j;
-            if f.block != hashes[index] || sha256d(&f.filter) != cfheaders.filter_hashes[index] {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!(
-                        "filter of block {} does not match its filter header",
-                        f.block
-                    ),
-                ));
-            }
-            filters.push(f.filter);
-        }
-    }
-    Ok(FilterBatch {
-        start,
-        hashes,
-        prev_header: cfheaders.prev_header,
-        filter_hashes: cfheaders.filter_hashes,
-        filters,
-    })
-}
-
-async fn checkpoints(inner: &Arc<Inner>, stop: BlockHash) -> Result<Vec<[u8; 32]>> {
-    let mut agreed: Option<Vec<[u8; 32]>> = None;
-    for peer in inner.pool.peers() {
-        let reply = peer
-            .request(
-                "getcfcheckpt",
-                encode_getcfcheckpt(SCRIPT_FILTER_TYPE, stop),
-                inner.config.request_timeout,
-                move |m| match decode_cfcheckpt(&m.payload) {
-                    Ok(c)
-                        if m.command == "cfcheckpt"
-                            && c.filter_type == SCRIPT_FILTER_TYPE
-                            && c.stop == stop =>
-                    {
-                        Step::Done
-                    }
-                    _ => Step::Skip,
-                },
-            )
-            .await;
-        let Ok(reply) = reply else { continue };
-        let Ok(list) = decode_cfcheckpt(&reply[0].payload) else {
-            continue;
-        };
-        match &agreed {
-            None => agreed = Some(list.headers),
-            Some(previous) => {
-                let common = previous.len().min(list.headers.len());
-                if previous[..common] != list.headers[..common] {
-                    return Err(Error::new(
-                        ErrorKind::InvalidData,
-                        "peers disagree on the filter header checkpoints",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(agreed.unwrap_or_default())
-}
-
-async fn sync_filters(inner: &Arc<Inner>) -> Result<()> {
-    let (tip, tip_hash) = {
-        let chain = inner.chain.read().expect("chain lock");
-        (chain.tip_height(), chain.tip_hash())
-    };
-    let first = inner.filters.read().expect("filters lock").len() as u32;
-    if first > tip {
-        return Ok(());
-    }
-    let generation = inner.generation.load(Ordering::SeqCst);
-    let checkpoints = if tip / CHECKPOINT_INTERVAL > first / CHECKPOINT_INTERVAL || first == 0 {
-        checkpoints(inner, tip_hash).await?
-    } else {
-        Vec::new()
-    };
-    let timeout = inner.config.request_timeout;
-    let mut pending: VecDeque<JoinHandle<Result<FilterBatch>>> = VecDeque::new();
-    let mut next = first;
-    let in_flight = inner.pool.peers().len().max(1) * 2;
-    let started = std::time::Instant::now();
-    loop {
-        while pending.len() < in_flight && next <= tip {
-            let end = (next + MAX_CFHEADERS_PER_MSG as u32 - 1).min(tip);
-            let hashes: Vec<BlockHash> = {
-                let chain = inner.chain.read().expect("chain lock");
-                (next..=end)
-                    .map(|h| chain.hash_at(h).expect("below tip"))
-                    .collect()
-            };
-            let peer = inner
-                .pool
-                .next_peer()
-                .ok_or_else(|| Error::new(ErrorKind::Unavailable, "no peer connected"))?;
-            pending.push_back(tokio::spawn(fetch_filter_batch(
-                peer, next, hashes, timeout,
-            )));
-            next = end + 1;
-        }
-        let Some(task) = pending.pop_front() else {
-            break;
-        };
-        let batch = task
-            .await
-            .map_err(|e| Error::new(ErrorKind::Stopped, e.to_string()))??;
-        if inner.generation.load(Ordering::SeqCst) != generation {
-            return Ok(());
-        }
-        let mut store = inner.filters.write().expect("filters lock");
-        if store.len() as u32 != batch.start {
-            return Ok(());
-        }
-        let prev = store
-            .tip()
-            .and_then(|t| store.filter_header(t))
-            .unwrap_or([0u8; 32]);
-        if batch.prev_header != prev {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("filter headers from {} do not chain to ours", batch.start),
-            ));
-        }
-        let chain = inner.chain.read().expect("chain lock");
-        let mut header = prev;
-        let mut items = Vec::with_capacity(batch.filters.len());
-        for (i, filter) in batch.filters.into_iter().enumerate() {
-            let height = batch.start + i as u32;
-            if chain.hash_at(height) != Some(batch.hashes[i]) {
-                return Ok(());
-            }
-            header = filter_header_from_hash(&batch.filter_hashes[i], &header);
-            if height % CHECKPOINT_INTERVAL == 0 && height > 0 {
-                if let Some(cp) = checkpoints.get((height / CHECKPOINT_INTERVAL - 1) as usize) {
-                    if *cp != header {
-                        return Err(Error::new(
-                            ErrorKind::InvalidData,
-                            format!("filter header at {height} differs from the checkpoint"),
-                        ));
-                    }
-                }
-            }
-            items.push((batch.hashes[i], header, filter));
-        }
-        store
-            .append(&items)
-            .map_err(|e| storage_error("filters", e))?;
-        let tip_now = store.tip();
-        drop(chain);
-        drop(store);
-        inner.state.send_modify(|s| s.filter_tip = tip_now);
-    }
-    if next > first + 1 {
-        info!(
-            from = first,
-            to = tip,
-            seconds = started.elapsed().as_secs_f64(),
-            "filters synced"
-        );
-    }
+    persist::save(inner);
     Ok(())
 }
 
@@ -1474,8 +1604,12 @@ async fn follow_tip(inner: &Arc<Inner>) -> Result<()> {
             // Too many blocks went by to read them all: start the mempool copy over.
             *inner.mempool.write().expect("mempool lock") =
                 Mempool::new(inner.config.mempool_max_bytes);
+            // Only peers that offer bloom filters take the mempool message;
+            // BCHN and kth disconnect the others for it.
             for peer in inner.pool.peers() {
-                peer.send("mempool", Vec::new());
+                if peer.info.services & NODE_BLOOM != 0 {
+                    peer.send("mempool", Vec::new());
+                }
             }
             tip
         }
@@ -1495,7 +1629,7 @@ async fn follow_tip(inner: &Arc<Inner>) -> Result<()> {
             for tx in &block.txs {
                 for (vout, output) in tx.outputs.iter().enumerate() {
                     let outpoint = OutPoint::new(tx.txid(), vout as u32);
-                    recent.outputs.insert(outpoint, output.value);
+                    recent.outputs.insert(outpoint, output.clone());
                     created.push(outpoint);
                 }
             }
@@ -1503,7 +1637,7 @@ async fn follow_tip(inner: &Arc<Inner>) -> Result<()> {
                 let inputs: Option<u64> = tx
                     .inputs
                     .iter()
-                    .map(|i| recent.outputs.get(&i.prevout).copied())
+                    .map(|i| recent.outputs.get(&i.prevout).map(|o| o.value))
                     .sum();
                 let outputs: u64 = tx.outputs.iter().map(|o| o.value).sum();
                 if let Some(fee) = inputs.and_then(|i| i.checked_sub(outputs)) {
@@ -1524,6 +1658,7 @@ async fn follow_tip(inner: &Arc<Inner>) -> Result<()> {
                 }
             }
         }
+        dsproofs::on_block(inner, &block);
         *inner.live_tip.lock().expect("live lock") = Some(height);
         if !removed.is_empty() {
             debug!(
@@ -1550,33 +1685,101 @@ async fn block_at(inner: &Arc<Inner>, height: u32) -> Result<Arc<Block>> {
         .hash_at(height)
         .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no block at height {height}")))?;
     let block = inner.fetcher.get(hash).await?;
-    let filter = inner
-        .filters
-        .read()
-        .expect("filters lock")
-        .read_checked(height);
-    if let Ok(filter) = filter {
-        if inner
-            .filters
-            .read()
-            .expect("filters lock")
-            .block_hash(height)
-            == Some(hash)
-        {
-            let check = check_block(&block, &filter).map_err(|e| {
-                Error::with_source(ErrorKind::InvalidData, format!("block {height}"), e)
-            })?;
-            let mut known = inner.txid_keys.lock().expect("lock");
-            if *known != Some(check.has_txid_keys) {
-                info!(
-                    supported = check.has_txid_keys,
-                    "filters with transaction keys"
-                );
-                *known = Some(check.has_txid_keys);
+    let filter = {
+        let store = inner.filters.read().expect("filters lock");
+        (store.block_hash(height) == Some(hash))
+            .then(|| store.read_checked(height).ok())
+            .flatten()
+    };
+    if let Some(filter) = filter {
+        match check_block(&block, &filter) {
+            Ok(check) => {
+                let mut known = inner.txid_keys.lock().expect("lock");
+                if *known != Some(check.has_txid_keys) {
+                    info!(
+                        supported = check.has_txid_keys,
+                        "filters with transaction keys"
+                    );
+                    *known = Some(check.has_txid_keys);
+                }
+            }
+            Err(e) => {
+                warn!(height, error = %e, "a script filter does not match its block");
+                drop_wrong_filters(inner, FilterKind::Script, height)?;
             }
         }
     }
+    check_rpa_filter(inner, height, &block)?;
     Ok(block)
+}
+
+/// A block against its stored input prefix filter, rebuilt from the block.
+/// A filter that does not match was served wrong (see [`drop_wrong_filters`]).
+fn check_rpa_filter(inner: &Arc<Inner>, height: u32, block: &Block) -> Result<()> {
+    let Some(store) = inner.store(FilterKind::Rpa) else {
+        return Ok(());
+    };
+    let stored = {
+        let store = store.read().expect("filters lock");
+        if store.block_hash(height) != Some(block.hash()) {
+            return Ok(());
+        }
+        store.read_checked(height).ok()
+    };
+    let Some(stored) = stored else { return Ok(()) };
+    if crate::rpa::build(block) != stored {
+        warn!(height, "an input prefix filter does not match its block");
+        drop_wrong_filters(inner, FilterKind::Rpa, height)?;
+    }
+    Ok(())
+}
+
+/// A stored filter that its block contradicts: the peer that served it is
+/// banned, and it goes with every filter above it, to be fetched again from
+/// the other peers. Histories read from script filters at or above it are
+/// read again. The block itself, checked against its header, stays usable.
+fn drop_wrong_filters(inner: &Arc<Inner>, kind: FilterKind, height: u32) -> Result<()> {
+    if let Some(addr) = filters::served_by(inner, kind, height) {
+        inner
+            .pool
+            .ban(&addr, "served a filter its block contradicts");
+    }
+    let store = inner.store(kind).expect("store");
+    store
+        .write()
+        .expect("filters lock")
+        .truncate_from(height)
+        .map_err(|e| storage_error("filters", e))?;
+    filters::forget_served(inner, kind, height);
+    let below = height.checked_sub(1);
+    inner.state.send_modify(|s| match kind {
+        FilterKind::Script => {
+            s.filter_tip = s.filter_tip.min(below);
+            s.synced = false;
+        }
+        FilterKind::Rpa => s.rpa_tip = s.rpa_tip.min(below),
+    });
+    if kind == FilterKind::Script {
+        let fork = below.unwrap_or(0);
+        let changed: Vec<Target> = {
+            let mut states = inner.targets.lock().expect("targets lock");
+            states
+                .values_mut()
+                .filter_map(|s| s.rollback(fork).then(|| s.target.clone()))
+                .collect()
+        };
+        {
+            let mut live = inner.live_tip.lock().expect("live lock");
+            *live = live.map(|l| l.min(fork));
+        }
+        inner.generation.fetch_add(1, Ordering::SeqCst);
+        persist::save(inner);
+        for target in changed {
+            inner.emit(Event::TargetChanged { target });
+        }
+    }
+    inner.wake.notify_one();
+    Ok(())
 }
 
 /// Heights from `from` on whose filters match `key`.
@@ -1783,8 +1986,107 @@ async fn catch_up(inner: &Arc<Inner>) -> Result<()> {
                 .filter_map(|k| states.get(k).map(|s| s.target.clone()))
                 .collect()
         };
+        persist::save(inner);
         for target in changed {
             inner.emit(Event::TargetChanged { target });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::WriteExt;
+    use crate::p2p::message::{encode_message, encode_version, read_message};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    const MAGIC: [u8; 4] = [0xfa, 0xbf, 0xb5, 0xda];
+
+    /// A node that takes a transaction in only after answering `late`
+    /// requests for it with notfound, as kth may (it admits transactions in
+    /// a task of their own), or that refuses it with a reject.
+    async fn node(listener: TcpListener, late: usize, refuse: bool) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut read, mut write) = stream.into_split();
+        let send = |command: &str, payload: &[u8]| encode_message(MAGIC, command, payload);
+        write
+            .write_all(&send("version", &encode_version("/slow/", true)))
+            .await
+            .unwrap();
+        write.write_all(&send("verack", &[])).await.unwrap();
+        let mut tx = Vec::new();
+        let mut asked = 0;
+        while let Ok(message) = read_message(&mut read, MAGIC, || {}).await {
+            let reply = match message.command.as_str() {
+                "tx" => {
+                    tx = message.payload;
+                    continue;
+                }
+                "getdata" if refuse => {
+                    let mut reject = Vec::new();
+                    reject.put_var_bytes(b"tx");
+                    reject.push(0x10);
+                    reject.put_var_bytes(b"bad-txns-inputs-missingorspent");
+                    reject.put_bytes(&sha256d(&tx));
+                    send("reject", &reject)
+                }
+                "getdata" => {
+                    asked += 1;
+                    if asked > late {
+                        send("tx", &tx)
+                    } else {
+                        send("notfound", &message.payload)
+                    }
+                }
+                _ => continue,
+            };
+            if write.write_all(&reply).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    async fn broadcast_to(late: usize, refuse: bool) -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(node(listener, late, refuse));
+        let options = PeerOptions {
+            magic: MAGIC,
+            user_agent: "/test/".into(),
+            relay: true,
+            transport: Transport::Direct,
+            isolate: false,
+            connect_timeout: Duration::from_secs(5),
+        };
+        let addr = PeerAddr {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let peer = Peer::connect(addr, &options, None).await.unwrap();
+        let tx = vec![0x42; 60];
+        peer.send("tx", tx.clone());
+        accepted_by(&peer, Txid(sha256d(&tx)), Duration::from_secs(5)).await
+    }
+
+    #[test]
+    fn the_relay_fee_is_the_connected_peers_median_capped() {
+        assert_eq!(relay_fee(vec![]), DEFAULT_RELAY_FEE);
+        // One peer asking a lot does not set it alone.
+        assert_eq!(relay_fee(vec![1000, 1000, 500_000]), 1000);
+        assert_eq!(relay_fee(vec![2000, 3000]), 3000);
+        assert_eq!(relay_fee(vec![900_000, 900_000]), MAX_RELAY_FEE);
+        assert_eq!(relay_fee(vec![0]), 1);
+    }
+
+    #[tokio::test]
+    async fn a_broadcast_waits_for_a_node_that_admits_transactions_later() {
+        broadcast_to(0, false).await.expect("taken at once");
+        broadcast_to(4, false)
+            .await
+            .expect("taken after four notfound");
+        let refused = broadcast_to(0, true).await.unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::Rejected);
+        assert!(refused.to_string().contains("missingorspent"), "{refused}");
     }
 }

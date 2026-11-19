@@ -47,6 +47,59 @@ pub fn bchd_txid_binary() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
+/// A binary a test needs: found, or the test is skipped with a note. In CI
+/// (the CI variable is set) a missing binary fails the test instead.
+fn required(found: Option<PathBuf>, what: &str) -> Option<PathBuf> {
+    if found.is_some() {
+        return found;
+    }
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "{what} is missing, and CI must run this test"
+    );
+    eprintln!("skipped: no {what}");
+    None
+}
+
+/// bchd for a test, or None (skipped) outside CI.
+pub fn bchd_or_skip() -> Option<PathBuf> {
+    required(bchd_binary(), "bchd binary (set BCHD_BIN)")
+}
+
+/// A bchd whose filters hold transaction keys, or None (skipped) outside CI.
+pub fn bchd_txid_binary_or_skip() -> Option<PathBuf> {
+    required(
+        bchd_txid_binary(),
+        "bchd with transaction keys in its filters (set BCHD_TXID_BIN)",
+    )
+}
+
+/// A bchd that serves input prefix filters (type 2) and relays double-spend
+/// proofs: $BCHD_RPA_BIN, or .tools/bchd-rpa(.exe).
+pub fn bchd_rpa_binary() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("BCHD_RPA_BIN") {
+        return Some(PathBuf::from(path));
+    }
+    let exe = if cfg!(windows) {
+        "bchd-rpa.exe"
+    } else {
+        "bchd-rpa"
+    };
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(".tools")
+        .join(exe);
+    path.exists().then_some(path)
+}
+
+/// A bchd with input prefix filters, or None (skipped) outside CI.
+pub fn bchd_rpa_or_skip() -> Option<PathBuf> {
+    required(
+        bchd_rpa_binary(),
+        "bchd with input prefix filters (set BCHD_RPA_BIN)",
+    )
+}
+
 /// A port the OS gives out now; bchd binds it right after.
 pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -125,50 +178,63 @@ impl Bchd {
 
     /// Starts the given bchd binary.
     pub async fn start_with(bin: &Path, name: &str) -> Bchd {
-        let dir =
-            std::env::temp_dir().join(format!("bch-light-client-it-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let p2p_port = free_port();
-        let rpc_port = free_port();
-        let log = std::fs::File::create(dir.join("stdout.log")).unwrap();
-        let child = Command::new(bin)
-            .arg("--regtest")
-            .arg(format!("--datadir={}", dir.join("data").display()))
-            .arg(format!("--logdir={}", dir.join("logs").display()))
-            .arg(format!("--listen=127.0.0.1:{p2p_port}"))
-            .arg(format!("--rpclisten=127.0.0.1:{rpc_port}"))
-            .arg("--rpcuser=u")
-            .arg("--rpcpass=p")
-            .arg("--notls")
-            .arg(format!("--miningaddr={MINING_ADDRESS}"))
-            .arg(format!(
-                "--debuglevel={}",
-                std::env::var("BCHD_DEBUGLEVEL").unwrap_or_else(|_| "info".into())
-            ))
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .expect("start bchd");
-        let node = Bchd {
-            child,
-            p2p_port,
-            rpc_port,
-            dir,
-        };
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if node.rpc_raw("getblockcount", json!([])).await.is_ok() {
-                break;
+        Self::start_args(bin, name, &[]).await
+    }
+
+    /// Starts the given bchd binary with more options.
+    pub async fn start_args(bin: &Path, name: &str, extra: &[&str]) -> Bchd {
+        // free_port hands out a port another process may take before bchd
+        // binds it: bchd then exits, and is started again on other ports.
+        for _ in 0..3 {
+            let dir = std::env::temp_dir()
+                .join(format!("bch-light-client-it-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let p2p_port = free_port();
+            let rpc_port = free_port();
+            let log = std::fs::File::create(dir.join("stdout.log")).unwrap();
+            let child = Command::new(bin)
+                .arg("--regtest")
+                .arg(format!("--datadir={}", dir.join("data").display()))
+                .arg(format!("--logdir={}", dir.join("logs").display()))
+                .arg(format!("--listen=127.0.0.1:{p2p_port}"))
+                .arg(format!("--rpclisten=127.0.0.1:{rpc_port}"))
+                .arg("--rpcuser=u")
+                .arg("--rpcpass=p")
+                .arg("--notls")
+                .arg(format!("--miningaddr={MINING_ADDRESS}"))
+                .arg(format!(
+                    "--debuglevel={}",
+                    std::env::var("BCHD_DEBUGLEVEL").unwrap_or_else(|_| "info".into())
+                ))
+                .args(extra)
+                .stdout(Stdio::from(log.try_clone().unwrap()))
+                .stderr(Stdio::from(log))
+                .spawn()
+                .expect("start bchd");
+            let mut node = Bchd {
+                child,
+                p2p_port,
+                rpc_port,
+                dir,
+            };
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if node.rpc_raw("getblockcount", json!([])).await.is_ok() {
+                    return node;
+                }
+                if matches!(node.child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "bchd did not start; see {}",
+                    node.dir.display()
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            assert!(
-                Instant::now() < deadline,
-                "bchd did not start; see {}",
-                node.dir.display()
-            );
-            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        node
+        panic!("bchd exited at start three times; see its stdout.log");
     }
 
     pub fn peer(&self) -> String {
@@ -596,4 +662,179 @@ pub async fn all_blocks(node: &Bchd) -> Vec<Value> {
         out.push(node.block(h).await);
     }
     out
+}
+
+/// A man in the middle between a client and a node: every message the node
+/// sends passes through `tamper`, which may change its payload (the length
+/// and checksum are made to fit). What the client sends passes unchanged.
+pub struct TamperProxy {
+    pub port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TamperProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl TamperProxy {
+    pub async fn start(node_port: u16, tamper: fn(&str, &mut Vec<u8>)) -> TamperProxy {
+        Self::rewriting(
+            node_port,
+            move |command: &mut String, payload: &mut Vec<u8>| tamper(command, payload),
+        )
+        .await
+    }
+
+    /// Like `start`, and `rewrite` may change the command too.
+    pub async fn rewriting(
+        node_port: u16,
+        rewrite: impl Fn(&mut String, &mut Vec<u8>) + Send + Sync + 'static,
+    ) -> TamperProxy {
+        Self::full(node_port, rewrite, |_: &str, _: &[u8]| {}).await
+    }
+
+    /// Passes everything unchanged, and shows `observe` every message the
+    /// client sends.
+    pub async fn observing(
+        node_port: u16,
+        observe: impl Fn(&str, &[u8]) + Send + Sync + 'static,
+    ) -> TamperProxy {
+        Self::full(node_port, |_: &mut String, _: &mut Vec<u8>| {}, observe).await
+    }
+
+    /// Passes everything but the node's block announcements: a headers
+    /// message the client did not ask for, or an inv with a block, reaches
+    /// the client under another name, which it ignores.
+    pub async fn without_block_announcements(node_port: u16) -> TamperProxy {
+        // getheaders the client sent and the node has not answered yet.
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let answered = asked.clone();
+        Self::full(
+            node_port,
+            move |command: &mut String, payload: &mut Vec<u8>| {
+                let announcement = match command.as_str() {
+                    "headers" => {
+                        let mut open = answered.lock().unwrap();
+                        let unasked = *open == 0;
+                        *open = open.saturating_sub(1);
+                        unasked
+                    }
+                    "inv" => inv_has_block(payload),
+                    _ => false,
+                };
+                if announcement {
+                    *command = "announcement".into();
+                }
+            },
+            move |command: &str, _: &[u8]| {
+                if command == "getheaders" {
+                    *asked.lock().unwrap() += 1;
+                }
+            },
+        )
+        .await
+    }
+
+    async fn full(
+        node_port: u16,
+        rewrite: impl Fn(&mut String, &mut Vec<u8>) + Send + Sync + 'static,
+        observe: impl Fn(&str, &[u8]) + Send + Sync + 'static,
+    ) -> TamperProxy {
+        let rewrite = std::sync::Arc::new(rewrite);
+        let observe = std::sync::Arc::new(observe);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(node) = TcpStream::connect(("127.0.0.1", node_port)).await else {
+                    continue;
+                };
+                let (mut from_client, mut to_client) = client.into_split();
+                let (mut from_node, mut to_node) = node.into_split();
+                let observe = observe.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut head = [0u8; 24];
+                        if from_client.read_exact(&mut head).await.is_err() {
+                            return;
+                        }
+                        let len = u32::from_le_bytes(head[16..20].try_into().unwrap()) as usize;
+                        let mut payload = vec![0u8; len];
+                        if from_client.read_exact(&mut payload).await.is_err() {
+                            return;
+                        }
+                        let command = String::from_utf8_lossy(&head[4..16])
+                            .trim_end_matches('\0')
+                            .to_string();
+                        observe(&command, &payload);
+                        if to_node.write_all(&head).await.is_err()
+                            || to_node.write_all(&payload).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+                let rewrite = rewrite.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut head = [0u8; 24];
+                        if from_node.read_exact(&mut head).await.is_err() {
+                            return;
+                        }
+                        let len = u32::from_le_bytes(head[16..20].try_into().unwrap()) as usize;
+                        let mut payload = vec![0u8; len];
+                        if from_node.read_exact(&mut payload).await.is_err() {
+                            return;
+                        }
+                        let mut command = String::from_utf8_lossy(&head[4..16])
+                            .trim_end_matches('\0')
+                            .to_string();
+                        rewrite(&mut command, &mut payload);
+                        let mut name = [0u8; 12];
+                        name[..command.len()].copy_from_slice(command.as_bytes());
+                        head[4..16].copy_from_slice(&name);
+                        head[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+                        head[20..24].copy_from_slice(&hash256(&payload)[..4]);
+                        if to_client.write_all(&head).await.is_err()
+                            || to_client.write_all(&payload).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        TamperProxy { port, task }
+    }
+
+    pub fn peer(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+}
+
+/// Whether an inv payload lists a block.
+fn inv_has_block(payload: &[u8]) -> bool {
+    let (start, count) = match payload.first() {
+        Some(0xfd) if payload.len() >= 3 => {
+            (3, usize::from(u16::from_le_bytes([payload[1], payload[2]])))
+        }
+        Some(&n) if n < 0xfd => (1, usize::from(n)),
+        _ => return false,
+    };
+    (0..count)
+        .any(|i| payload.get(start + i * 36..start + i * 36 + 4) == Some(&2u32.to_le_bytes()[..]))
+}
+
+/// Where the filter hashes of a cfheaders payload start, and how many there are.
+pub fn cfheaders_hashes(payload: &[u8]) -> (usize, usize) {
+    // filter type, stop hash, previous filter header, then a count.
+    match payload[65] {
+        0xfd => (
+            68,
+            usize::from(u16::from_le_bytes([payload[66], payload[67]])),
+        ),
+        n => (66, usize::from(n)),
+    }
 }

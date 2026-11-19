@@ -154,8 +154,7 @@ async fn compare(node: &Bchd, client: &LightClient, targets: &[(&str, Target)], 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn histories_match_bchd_through_blocks_mempool_and_a_reorg() {
     init_tracing();
-    let Some(bin) = bchd_binary() else {
-        eprintln!("skipped: no bchd binary (set BCHD_BIN)");
+    let Some(bin) = bchd_or_skip() else {
         return;
     };
     histories_scenario(&bin, "histories", false).await;
@@ -166,8 +165,7 @@ async fn histories_match_bchd_through_blocks_mempool_and_a_reorg() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn histories_and_txid_lookups_with_transaction_keys() {
     init_tracing();
-    let Some(bin) = bchd_txid_binary() else {
-        eprintln!("skipped: no bchd with transaction keys (set BCHD_TXID_BIN)");
+    let Some(bin) = bchd_txid_binary_or_skip() else {
         return;
     };
     histories_scenario(&bin, "histories-txid", true).await;
@@ -292,7 +290,31 @@ async fn histories_scenario(bin: &std::path::Path, name: &str, txid_keys: bool) 
         "received in f1, spent and re-received in s1"
     );
 
-    // Unconfirmed: a payment to P2PKH, and a child spending it to P2SH32.
+    // A coin of a script nobody watches, from a transaction no watched
+    // history has, buried deeper than the blocks whose outputs the client
+    // keeps: the mempool copy knows no value for it.
+    let (hop_redeem, unwatched_redeem) = (vec![0x57, 0x75, 0x51], vec![0x56, 0x75, 0x51]);
+    let (cb9, v9) = node.coinbase(9).await;
+    let hop = TxSpec {
+        inputs: vec![(cb9, Unlock::Redeem(vec![0x51]))],
+        outputs: vec![(v9 - FEE, p2sh20(&hop_redeem), vec![])],
+    }
+    .build();
+    let u = TxSpec {
+        inputs: vec![(OutPoint::new(txid_of(&hop), 0), Unlock::Redeem(hop_redeem))],
+        outputs: vec![(v9 - 2 * FEE, p2sh20(&unwatched_redeem), vec![])],
+    }
+    .build();
+    node.send(&hop).await;
+    node.send(&u).await;
+    // Followed block by block, so that the client keeps only the last ones.
+    for _ in 0..30 {
+        node.generate(1).await;
+        wait_tip(&node, &pooled).await;
+    }
+
+    // Unconfirmed: a payment to P2PKH, and a child spending it to P2SH32;
+    // another payment to P2PKH from the unwatched coin.
     let mut events = pooled.subscribe();
     let (cb4, v4) = node.coinbase(4).await;
     let m1 = TxSpec {
@@ -311,9 +333,18 @@ async fn histories_scenario(bin: &std::path::Path, name: &str, txid_keys: bool) 
         outputs: vec![(50_000_000 - FEE, b.clone(), vec![])],
     }
     .build();
+    let m3 = TxSpec {
+        inputs: vec![(
+            OutPoint::new(txid_of(&u), 0),
+            Unlock::Redeem(unwatched_redeem.clone()),
+        )],
+        outputs: vec![(v9 - 3 * FEE, p2pkh.clone(), vec![])],
+    }
+    .build();
     node.send(&m1).await;
     node.send(&m2).await;
-    wait_mempool(&pooled, &[txid_of(&m1), txid_of(&m2)]).await;
+    node.send(&m3).await;
+    wait_mempool(&pooled, &[txid_of(&m1), txid_of(&m2), txid_of(&m3)]).await;
     compare(&node, &pooled, &targets, "mempool").await;
     let p2pkh_target = Target::Script(p2pkh.clone());
     let mut notified = false;
@@ -332,6 +363,15 @@ async fn histories_scenario(bin: &std::path::Path, name: &str, txid_keys: bool) 
         .expect("child in mempool history");
     assert!(child.unconfirmed_parent);
     assert_eq!(child.fee, Some(FEE));
+    // The unwatched coin's value is not held, and its block is never
+    // fetched to learn it (that would show the peer the payment): the fee
+    // stays unknown, with transaction keys in the filters or without.
+    let from_unwatched = history
+        .mempool
+        .iter()
+        .find(|e| e.txid == txid_of(&m3))
+        .expect("payment from the unwatched coin");
+    assert_eq!(from_unwatched.fee, None);
     node.generate(1).await;
     compare(&node, &pooled, &targets, "mempool confirmed").await;
     let new_tip = node.height().await;
@@ -410,7 +450,7 @@ async fn histories_scenario(bin: &std::path::Path, name: &str, txid_keys: bool) 
     let header = pooled.header(proof.height).unwrap();
     assert_eq!(
         bch_light_client::block::merkle_fold(f1id.0, proof.position as usize, &proof.branch),
-        header.merkle_root
+        Some(header.merkle_root)
     );
     let (at, at_proof) = pooled.transaction_at(111, proof.position).await.unwrap();
     assert_eq!(at.txid(), f1id);
@@ -433,7 +473,7 @@ async fn histories_scenario(bin: &std::path::Path, name: &str, txid_keys: bool) 
     let (header_branch, root) = pooled.header_branch(5, tip).unwrap();
     assert_eq!(
         bch_light_client::block::merkle_fold(pooled.header(5).unwrap().hash().0, 5, &header_branch),
-        root
+        Some(root)
     );
     let fees = pooled.fee_estimate();
     assert!(
@@ -461,7 +501,7 @@ async fn histories_scenario(bin: &std::path::Path, name: &str, txid_keys: bool) 
             .expect("proof by ID alone");
         assert_eq!(
             bch_light_client::block::merkle_fold(gid.0, proof.position as usize, &proof.branch),
-            isolated.header(proof.height).unwrap().merkle_root
+            Some(isolated.header(proof.height).unwrap().merkle_root)
         );
         let unspent = isolated.output(OutPoint::new(f1id, 4), None).await.unwrap();
         assert_eq!(unspent.map(|o| o.value), Some(v1 - 2_000_000_000 - FEE));
@@ -502,8 +542,7 @@ async fn histories_scenario(bin: &std::path::Path, name: &str, txid_keys: bool) 
 #[ignore = "takes minutes; run with --ignored"]
 async fn measure_sync_and_lookups() {
     init_tracing();
-    if bchd_binary().is_none() {
-        eprintln!("skipped: no bchd binary (set BCHD_BIN)");
+    if bchd_or_skip().is_none() {
         return;
     }
     let blocks: u32 = std::env::var("MEASURE_BLOCKS")
@@ -559,7 +598,11 @@ async fn measure_sync_and_lookups() {
     let by_id = if client.status().txid_keys == Some(true) {
         let t = Instant::now();
         let found = client.transaction(payments[2], None).await.unwrap();
-        format!("lookup by ID alone={:?} [height {}]", t.elapsed(), found.confirmation.unwrap().height)
+        format!(
+            "lookup by ID alone={:?} [height {}]",
+            t.elapsed(),
+            found.confirmation.unwrap().height
+        )
     } else {
         "no transaction keys in these filters".to_string()
     };
@@ -594,8 +637,7 @@ async fn measure_sync_and_lookups() {
 #[ignore = "waits two minutes; run with --ignored"]
 async fn service_connection_stays_up_when_idle() {
     init_tracing();
-    let Some(bin) = bchd_binary() else {
-        eprintln!("skipped: no bchd binary (set BCHD_BIN)");
+    let Some(bin) = bchd_or_skip() else {
         return;
     };
     let node = Bchd::start_with(&bin, "idle").await;
@@ -641,11 +683,18 @@ async fn mainnet_headers_follow_the_difficulty_rules() {
         if height > 940_000 && height == last {
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(1800), "headers stalled at {height}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1800),
+            "headers stalled at {height}"
+        );
         last = height;
     }
     let tip = client.header(last).unwrap();
-    eprintln!("MAINNET headers={last} tip={} time={:?}", tip.hash(), started.elapsed());
+    eprintln!(
+        "MAINNET headers={last} tip={} time={:?}",
+        tip.hash(),
+        started.elapsed()
+    );
     client.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

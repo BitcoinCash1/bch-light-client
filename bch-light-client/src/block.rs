@@ -126,19 +126,26 @@ pub fn merkle_branch(leaves: &[[u8; 32]], pos: usize) -> Vec<[u8; 32]> {
     branch
 }
 
-/// Folds a leaf with its branch to the root it proves.
-pub fn merkle_fold(leaf: [u8; 32], pos: usize, branch: &[[u8; 32]]) -> [u8; 32] {
+/// Folds a leaf with its branch to the root it proves; None for a position
+/// that does not exist. The last node of an odd level is paired with itself,
+/// so a node at an odd index whose left sibling equals it would be that
+/// copy: a phantom position past the end of the level, which folds to the
+/// true root (CVE-2012-2459). A true node never equals its left sibling.
+pub fn merkle_fold(leaf: [u8; 32], pos: usize, branch: &[[u8; 32]]) -> Option<[u8; 32]> {
     let mut node = leaf;
     let mut index = pos;
     for sibling in branch {
         node = if index & 1 == 1 {
+            if *sibling == node {
+                return None;
+            }
             sha256d_pair(sibling, &node)
         } else {
             sha256d_pair(&node, sibling)
         };
         index >>= 1;
     }
-    node
+    Some(node)
 }
 
 #[cfg(test)]
@@ -167,7 +174,7 @@ mod tests {
         let leaves: Vec<[u8; 32]> = txids.iter().map(|t| t.0).collect();
         for pos in 0..leaves.len() {
             let branch = merkle_branch(&leaves, pos);
-            assert_eq!(merkle_fold(leaves[pos], pos, &branch), root);
+            assert_eq!(merkle_fold(leaves[pos], pos, &branch), Some(root));
         }
         // Repeating the last two of six transactions keeps the root of the six.
         let six: Vec<Txid> = (0u8..6).map(|i| Txid(sha256d(&[i]))).collect();
@@ -177,5 +184,23 @@ mod tests {
         let (root8, mutated8) = merkle_root(&eight);
         assert_eq!(root6, root8);
         assert!(mutated8);
+    }
+
+    #[test]
+    fn a_phantom_position_past_an_odd_level_is_refused() {
+        let ids: Vec<[u8; 32]> = (0u8..5).map(|i| sha256d(&[i])).collect();
+        let txids: Vec<Txid> = ids.iter().map(|i| Txid(*i)).collect();
+        // Three transactions: position 3 is the copy of position 2.
+        let (root3, _) = merkle_root(&txids[..3]);
+        let branch = merkle_branch(&ids[..3], 2);
+        assert_eq!(merkle_fold(ids[2], 2, &branch), Some(root3));
+        assert_eq!(merkle_fold(ids[2], 3, &branch), None);
+        // Five: position 6 pairs the fifth with itself, as position 4 does,
+        // and is caught a level up, where its node copies its left sibling.
+        let (root5, _) = merkle_root(&txids);
+        let branch = merkle_branch(&ids, 4);
+        assert_eq!(merkle_fold(ids[4], 4, &branch), Some(root5));
+        assert_eq!(merkle_fold(ids[4], 6, &branch), None);
+        assert_eq!(merkle_fold(ids[4], 5, &branch), None);
     }
 }

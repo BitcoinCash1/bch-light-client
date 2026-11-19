@@ -57,6 +57,19 @@ impl Mempool {
         self.txs.values()
     }
 
+    /// Records the fee of a transaction whose spent values were found after
+    /// it came in.
+    pub fn set_fee(&mut self, txid: &Txid, fee: u64) {
+        if let Some(entry) = self.txs.get_mut(txid) {
+            if entry.fee.is_none() {
+                *entry = Arc::new(MempoolTx {
+                    tx: entry.tx.clone(),
+                    fee: Some(fee),
+                });
+            }
+        }
+    }
+
     /// The mempool transaction that spends `outpoint`.
     pub fn spender(&self, outpoint: &OutPoint) -> Option<Txid> {
         self.spends.get(outpoint).copied()

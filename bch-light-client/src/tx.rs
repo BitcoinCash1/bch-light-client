@@ -121,7 +121,6 @@ const HAS_AMOUNT: u8 = 0x10;
 const HAS_NFT: u8 = 0x20;
 const HAS_COMMITMENT_LENGTH: u8 = 0x40;
 const RESERVED_BIT: u8 = 0x80;
-const MAX_COMMITMENT_LENGTH: u64 = 128;
 const MAX_TOKEN_AMOUNT: u64 = i64::MAX as u64;
 
 impl TokenData {
@@ -154,11 +153,14 @@ impl TokenData {
             return None;
         }
         let commitment = if has_commitment {
+            // The encoding sets no upper limit: a longer commitment than
+            // consensus allows (40 bytes, 128 since May 2026) is a valid
+            // prefix in a transaction that consensus refuses.
             let len = r.compact_size().ok()?;
-            if !(1..=MAX_COMMITMENT_LENGTH).contains(&len) {
+            if len == 0 {
                 return None;
             }
-            r.bytes(len as usize).ok()?.to_vec()
+            r.bytes(usize::try_from(len).ok()?).ok()?.to_vec()
         } else {
             Vec::new()
         };
@@ -404,6 +406,74 @@ mod tests {
             assert_eq!(tx.outputs[0].script, script);
             assert_eq!(tx.serialize(), raw);
             assert_eq!(tx.size(), raw.len());
+        }
+    }
+
+    fn libauth_vectors(name: &str) -> Vec<serde_json::Value> {
+        let path = format!("{}/tests/data/libauth/{name}", env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(path).expect("vectors");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        value.as_array().unwrap().clone()
+    }
+
+    /// The token prefix vectors of bitauth/libauth (MIT License, copyright
+    /// Jason Dreyzehner; tests/data/libauth/LICENSE), src/lib/message/
+    /// fixtures/token-prefix-valid.json, as copied into mainnet-pat/libauth-rs
+    /// at be3ed163, which adds one vector: a 128-byte commitment.
+    #[test]
+    fn libauth_valid_token_prefixes_decode_and_encode_exactly() {
+        let vectors = libauth_vectors("token-prefix-valid.json");
+        assert_eq!(vectors.len(), 63);
+        let script = [0x51];
+        for v in vectors {
+            let prefix = hex::decode(v["prefix"].as_str().unwrap()).unwrap();
+            let data = &v["data"];
+            let expected = TokenData {
+                category: Category::from_hex(data["category"].as_str().unwrap()).unwrap(),
+                amount: data["amount"].as_str().unwrap().parse().unwrap(),
+                nft: data.get("nft").map(|nft| Nft {
+                    capability: match nft["capability"].as_str().unwrap() {
+                        "none" => NftCapability::None,
+                        "mutable" => NftCapability::Mutable,
+                        "minting" => NftCapability::Minting,
+                        other => panic!("capability {other}"),
+                    },
+                    commitment: hex::decode(nft["commitment"].as_str().unwrap()).unwrap(),
+                }),
+            };
+            let label = v["prefix"].as_str().unwrap();
+            let (token, rest) = TokenData::split(&prefix);
+            assert_eq!(token.as_ref(), Some(&expected), "{label}");
+            assert!(rest.is_empty(), "{label}");
+            assert_eq!(expected.prefix(), prefix, "{label}");
+            // In a transaction, followed by locking bytecode.
+            let mut field = prefix.clone();
+            field.extend_from_slice(&script);
+            let raw = tx_with_field(&field);
+            let tx = Transaction::from_bytes(&raw).unwrap();
+            assert_eq!(tx.outputs[0].token.as_ref(), Some(&expected), "{label}");
+            assert_eq!(tx.outputs[0].script, script);
+            assert_eq!(tx.serialize(), raw);
+        }
+    }
+
+    /// The invalid token prefix vectors of the same source,
+    /// src/lib/message/fixtures/token-prefix-invalid.json: none is token
+    /// data, and the whole field stays locking bytecode.
+    #[test]
+    fn libauth_invalid_token_prefixes_are_refused() {
+        let vectors = libauth_vectors("token-prefix-invalid.json");
+        assert_eq!(vectors.len(), 55);
+        for v in vectors {
+            let prefix = hex::decode(v["prefix"].as_str().unwrap()).unwrap();
+            let label = format!("{}: {}", v["prefix"], v["error"]);
+            let (token, rest) = TokenData::split(&prefix);
+            assert_eq!(token, None, "{label}");
+            assert_eq!(rest, prefix.as_slice(), "{label}");
+            let raw = tx_with_field(&prefix);
+            let tx = Transaction::from_bytes(&raw).unwrap();
+            assert!(tx.outputs[0].token.is_none(), "{label}");
+            assert_eq!(tx.serialize(), raw);
         }
     }
 

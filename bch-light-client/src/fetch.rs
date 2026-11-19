@@ -26,6 +26,8 @@ pub struct BlockFetcher {
     timeout: Duration,
     slots: Semaphore,
     cache: Mutex<BlockCache>,
+    bytes: std::sync::atomic::AtomicU64,
+    count: std::sync::atomic::AtomicU64,
     inflight: Mutex<HashMap<BlockHash, Waiters>>,
 }
 
@@ -79,8 +81,16 @@ impl BlockFetcher {
                 bytes: 0,
                 max_bytes: cache_bytes,
             }),
+            bytes: std::sync::atomic::AtomicU64::new(0),
+            count: std::sync::atomic::AtomicU64::new(0),
             inflight: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Bytes and blocks downloaded so far.
+    pub fn downloaded(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.bytes.load(Relaxed), self.count.load(Relaxed))
     }
 
     pub fn cached(&self, hash: &BlockHash) -> Option<Arc<Block>> {
@@ -157,6 +167,10 @@ impl BlockFetcher {
             };
             match outcome {
                 Ok(raw) => {
+                    self.bytes
+                        .fetch_add(raw.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    self.count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let block = tokio::task::spawn_blocking(move || Block::from_bytes(&raw))
                         .await
                         .map_err(|e| Error::new(ErrorKind::Stopped, e.to_string()))?

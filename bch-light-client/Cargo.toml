@@ -8,7 +8,9 @@ description = "A Bitcoin Cash light client library: block headers, script filter
 
 [dependencies]
 hex = "0.4"
+k256 = { version = "0.13", features = ["ecdsa", "expose-field"] }
 rand = "0.8"
+ripemd = "0.1"
 serde = { version = "1", features = ["derive"], optional = true }
 sha2 = "0.10"
 thiserror = "2"
@@ -20,8 +22,6 @@ default = []
 serde = ["dep:serde"]
 
 [dev-dependencies]
-k256 = { version = "0.13", features = ["ecdsa"] }
-ripemd = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

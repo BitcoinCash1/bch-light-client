@@ -30,7 +30,10 @@
 //!   filters, relay every transaction they accept, and see every new block
 //!   at the tip fetched, since the client downloads all of them. None of
 //!   that depends on what the wallet watches. They see a broadcast
-//!   transaction's origin unless it goes through a proxy.
+//!   transaction's origin unless it goes through a proxy. A configured node
+//!   that serves no filters (such as BCHN) is a service peer for headers,
+//!   blocks, relay, its mempool and double-spend proofs, and is never asked
+//!   for filters.
 //! - **Block downloads for a scan** are the one place interest shows: a peer
 //!   that serves a block a wallet needed learns that the block is one of
 //!   those the wallet's filters matched. A peer that sees the same client
@@ -62,10 +65,13 @@
     clippy::chunks_exact_with_const_size
 )]
 
+pub mod bcmr;
 pub mod block;
 pub mod cashaddr;
 pub mod chain;
 mod client;
+pub mod dispute;
+pub mod dsproof;
 pub mod encode;
 mod error;
 pub mod fetch;
@@ -78,15 +84,19 @@ pub mod mempool;
 pub mod p2p;
 pub mod params;
 pub mod pow;
+pub mod rpa;
 pub mod scan;
+pub mod script;
 pub mod tx;
 
 pub use client::{
-    Balance, Config, Confirmation, Event, FeeEstimate, History, LightClient, MempoolEntry,
-    MempoolSummary, MerkleProof, OutputInfo, Status, TokenFilter, TxInfo, Utxo,
+    balances_of, supply_of, Authchain, Balance, CategoryBalance, Config, Confirmation, DsProofInfo,
+    Event, FeeEstimate, History, LightClient, MempoolEntry, MempoolSummary, MerkleProof,
+    OutputInfo, RpaMatch, Stats, Status, TokenFilter, TokenHolding, TokenSupply, TxInfo, Utxo,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use hash::{BlockHash, Txid};
 pub use history::{ConfirmedTx, Received, Spent, Target};
 pub use params::Network;
+pub use rpa::Prefix;
 pub use tx::{Category, Nft, NftCapability, OutPoint, TokenData, Transaction, TxOut};

@@ -1,11 +1,13 @@
 //! The Electrum protocol methods, each answered through the light client.
 
 use crate::session::{RpcError, ScriptSub, Session};
+use bch_light_client::bcmr::{registry_matches, Publication};
 use bch_light_client::block::BlockHeader;
 use bch_light_client::cashaddr::Address;
+use bch_light_client::script;
 use bch_light_client::{
-    BlockHash, ErrorKind, History, LightClient, OutPoint, Target, TokenData, TokenFilter,
-    Transaction, Txid,
+    Authchain, BlockHash, Category, DsProofInfo, ErrorKind, History, LightClient, Nft, OutPoint,
+    Prefix, Target, TokenData, TokenFilter, Transaction, Txid,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -182,14 +184,24 @@ pub async fn tx_status(client: &LightClient, txid: Txid) -> Value {
     }
 }
 
-fn script_type(script: &[u8]) -> &'static str {
-    match script {
-        [0x76, 0xa9, 0x14, .., 0x88, 0xac] if script.len() == 25 => "pubkeyhash",
-        [0xa9, 0x14, .., 0x87] if script.len() == 23 => "scripthash",
-        [0xaa, 0x20, .., 0x87] if script.len() == 35 => "scripthash32",
-        [0x6a, ..] => "nulldata",
-        _ => "nonstandard",
+/// A locking script as BCHN's getrawtransaction shows it, which Fulcrum
+/// passes on: asm, hex, type, and the required signatures and addresses of
+/// the types that have them (token-unaware addresses, as BCHN writes them).
+fn script_pubkey_json(script: &[u8], prefix: &str) -> Value {
+    let solution = script::solve(script);
+    let mut spk = json!({
+        "asm": script::to_asm(script, false),
+        "hex": hex::encode(script),
+        "type": solution.kind.as_str(),
+    });
+    if let Some((required, addresses)) = solution.destinations {
+        spk["reqSigs"] = json!(required);
+        spk["addresses"] = json!(addresses
+            .iter()
+            .filter_map(|a| a.encode(prefix).ok())
+            .collect::<Vec<_>>());
     }
+    spk
 }
 
 fn verbose_tx(
@@ -208,7 +220,10 @@ fn verbose_tx(
                 json!({
                     "txid": i.prevout.txid.to_hex(),
                     "vout": i.prevout.vout,
-                    "scriptSig": {"asm": "", "hex": hex::encode(&i.script_sig)},
+                    "scriptSig": {
+                        "asm": script::to_asm(&i.script_sig, true),
+                        "hex": hex::encode(&i.script_sig),
+                    },
                     "sequence": i.sequence,
                 })
             }
@@ -219,11 +234,7 @@ fn verbose_tx(
         .iter()
         .enumerate()
         .map(|(n, o)| {
-            let mut spk =
-                json!({"asm": "", "hex": hex::encode(&o.script), "type": script_type(&o.script)});
-            if let Ok(address) = Address::from_script(&o.script, o.token.is_some()) {
-                spk["addresses"] = json!([address.encode(prefix)]);
-            }
+            let spk = script_pubkey_json(&o.script, prefix);
             let mut out = json!({"value": o.value as f64 / 1e8, "n": n, "scriptPubKey": spk});
             if let Some(token) = &o.token {
                 out["tokenData"] = token_json(token);
@@ -361,17 +372,29 @@ pub async fn call(session: &Arc<Session>, method: &str, params: &[Value]) -> Res
         "server.ping" => Ok(Value::Null),
         "server.peers.subscribe" => Ok(json!([])),
         "server.add_peer" => Ok(json!(false)),
-        "server.features" => Ok(json!({
-            "genesis_hash": session.shared.network.params().genesis_hash().to_hex(),
-            "hosts": {},
-            "protocol_min": version_string(PROTOCOL_MIN),
-            "protocol_max": version_string(PROTOCOL_MAX),
-            "server_version": SERVER_VERSION,
-            "hash_function": "sha256",
-            "pruning": null,
-            "dsproof": false,
-            "cashtokens": true,
-        })),
+        "server.features" => {
+            let mut features = json!({
+                "genesis_hash": session.shared.network.params().genesis_hash().to_hex(),
+                "hosts": {},
+                "protocol_min": version_string(PROTOCOL_MIN),
+                "protocol_max": version_string(PROTOCOL_MAX),
+                "server_version": SERVER_VERSION,
+                "hash_function": "sha256",
+                "pruning": null,
+                "dsproof": true,
+                "cashtokens": true,
+            });
+            if let Some((start, _)) = client.rpa_heights() {
+                features["rpa"] = json!({
+                    "prefix_bits_min": RPA_PREFIX_BITS_MIN,
+                    "prefix_bits": 16,
+                    "starting_height": start,
+                    "history_block_limit": RPA_HISTORY_BLOCK_LIMIT,
+                    "max_history": RPA_MAX_HISTORY,
+                });
+            }
+            Ok(features)
+        }
 
         "blockchain.headers.subscribe" | "blockchain.headers.get_tip" => {
             if method == "blockchain.headers.subscribe" {
@@ -625,26 +648,307 @@ pub async fn call(session: &Arc<Session>, method: &str, params: &[Value]) -> Res
         }
         "mempool.get_fee_histogram" => Ok(json!(fee_histogram(&client.mempool_summary().fee_rates))),
         "mempool.get_info" => {
+            // What Fulcrum keeps of BCHN's getmempoolinfo: BCHN has no
+            // incremental relay fee, unbroadcast count or full RBF.
             let relay = client.fee_estimate().relay as f64 / 1e8;
-            Ok(json!({"mempoolminfee": relay, "minrelaytxfee": relay, "incrementalrelayfee": relay}))
+            Ok(json!({"mempoolminfee": relay, "minrelaytxfee": relay}))
         }
 
-        "blockchain.rpa.get_history" | "blockchain.rpa.get_mempool" | "blockchain.reusable.get_history"
-        | "blockchain.reusable.get_mempool" => Err(RpcError::not_found(
-            "RPA lookups are not available yet: they need input prefix filters (filter type 2), planned for phase 2",
-        )),
-        "blockchain.transaction.dsproof.get"
-        | "blockchain.transaction.dsproof.list"
-        | "blockchain.transaction.dsproof.subscribe"
-        | "blockchain.transaction.dsproof.unsubscribe" => {
-            Err(RpcError::not_found("This server lacks dsproof support (not available yet, planned for phase 2)"))
+        "blockchain.rpa.get_history" => {
+            let prefix = rpa_prefix_arg(params, 0)?;
+            let from = from_height_arg(params, 1)?;
+            let to = to_height_arg(params, 2, from)?;
+            rpa_history(client, prefix, from, to).await
+        }
+        "blockchain.reusable.get_history" => {
+            // The older form: (from, count, prefix).
+            let prefix = rpa_prefix_arg(params, 2)?;
+            let from = from_height_arg(params, 0)?;
+            let count = arg(params, 1)
+                .and_then(Value::as_i64)
+                .filter(|c| *c >= 0)
+                .ok_or_else(|| RpcError::params("Bad count argument"))?;
+            let to = from.saturating_add(u32::try_from(count).unwrap_or(u32::MAX));
+            rpa_history(client, prefix, from, Some(to)).await
+        }
+        "blockchain.rpa.get_mempool" | "blockchain.reusable.get_mempool" => {
+            let prefix = rpa_prefix_arg(params, 0)?;
+            if client.rpa_heights().is_none() {
+                return Err(RpcError::not_found("RPA support is disabled on this server"));
+            }
+            let mut rows = Vec::new();
+            for m in client.rpa_mempool(prefix) {
+                let txid = m.tx.txid();
+                let mut row = json!({
+                    "tx_hash": txid.to_hex(),
+                    "height": if m.unconfirmed_parent { -1 } else { 0 },
+                });
+                let fee = match m.fee {
+                    Some(fee) => Some(fee),
+                    // From what the client holds only: fetching the
+                    // payer's coins would show which payment is the wallet's.
+                    None => client.mempool_fee(txid),
+                };
+                if let Some(fee) = fee {
+                    row["fee"] = json!(fee);
+                }
+                rows.push(row);
+            }
+            Ok(json!(rows))
+        }
+        "blockchain.transaction.dsproof.get" => {
+            let hash = hash_arg(params, 0, "Invalid dsp hash or tx hash")?;
+            Ok(client.ds_proof(hash).map_or(Value::Null, |p| dsproof_json(&p)))
+        }
+        "blockchain.transaction.dsproof.list" => {
+            let mut txids: Vec<String> = client
+                .ds_proofs()
+                .iter()
+                .flat_map(|p| p.descendants.iter().map(|t| t.to_hex()))
+                .collect();
+            txids.sort();
+            txids.dedup();
+            Ok(json!(txids))
+        }
+        "blockchain.transaction.dsproof.subscribe" => {
+            let txid = txid_arg(params, 0)?;
+            let current = client.ds_proof(txid.0).map_or(Value::Null, |p| dsproof_json(&p));
+            session.state.lock().expect("session lock").dsproofs.insert(txid, current.clone());
+            Ok(current)
+        }
+        "blockchain.transaction.dsproof.unsubscribe" => {
+            let txid = txid_arg(params, 0)?;
+            Ok(json!(session.state.lock().expect("session lock").dsproofs.remove(&txid).is_some()))
+        }
+        // Extensions of this bridge, not Fulcrum's: tokens and identities
+        // without an index. Their names say so.
+        "light_client.token.balances" => {
+            let (target, _) = scripthash_arg(params)?;
+            let balances = client.token_balances(&target).await?;
+            Ok(json!(balances
+                .iter()
+                .map(|b| json!({
+                    "category": b.category.to_hex(),
+                    "amount": b.fungible.to_string(),
+                    "nfts": nfts_json(&b.nfts),
+                }))
+                .collect::<Vec<_>>()))
+        }
+        "light_client.token.supply" => {
+            let category = category_arg(params, 0)?;
+            let s = client.token_supply(category).await?;
+            Ok(json!({
+                "category": s.category.to_hex(),
+                "total": s.total.to_string(),
+                "reserved": s.reserved.to_string(),
+                "circulating": s.circulating.to_string(),
+                "nfts": {"minting": s.minting, "mutable": s.mutable, "immutable": s.immutable},
+                "holders": s.holders.iter().map(|h| json!({
+                    "scripthash": reversed_hex(&bch_light_client::hash::sha256(&h.script)),
+                    "amount": h.fungible.to_string(),
+                    "nfts": nfts_json(&h.nfts),
+                })).collect::<Vec<_>>(),
+                "height": s.height,
+            }))
+        }
+        "light_client.token.genesis" => {
+            let category = category_arg(params, 0)?;
+            let info = client.token_genesis(category).await.map_err(lookup_error)?;
+            Ok(json!({
+                "tx_hash": info.tx.txid().to_hex(),
+                "height": info.confirmation.map_or(0, |c| c.height),
+                "block_hash": info.confirmation.map(|c| c.block_hash.to_hex()),
+            }))
+        }
+        "light_client.bcmr.resolve" => {
+            let authbase = txid_arg(params, 0)?;
+            let hint = u32_arg(params, 1, "authbase height")?;
+            let track = bool_arg(params, 2)?;
+            let chain = client.resolve_authchain(authbase, hint, track).await?;
+            Ok(authchain_json(&chain))
+        }
+        "light_client.bcmr.resolve_extension" => {
+            let authbase = txid_arg(params, 0)?;
+            let raw: Vec<Vec<u8>> = arg(params, 1)
+                .and_then(Value::as_array)
+                .ok_or_else(|| RpcError::params("missing or bad authchain"))?
+                .iter()
+                .map(|v| v.as_str().and_then(|s| hex::decode(s).ok()))
+                .collect::<Option<_>>()
+                .ok_or_else(|| RpcError::params("the authchain is a list of hex transactions"))?;
+            let track = bool_arg(params, 2)?;
+            let chain = client.resolve_authchain_from(authbase, &raw, track).await?;
+            Ok(authchain_json(&chain))
+        }
+        "light_client.bcmr.verify_registry" => {
+            let registry = hex::decode(str_arg(params, 0, "registry")?)
+                .map_err(|_| RpcError::params("the registry is hex"))?;
+            let mut hash = [0u8; 32];
+            hex::decode_to_slice(str_arg(params, 1, "hash")?, &mut hash)
+                .map_err(|_| RpcError::params("the hash is 32 bytes of hex, as published"))?;
+            let publication = Publication::Registry {
+                hash,
+                uris: vec![],
+            };
+            Ok(json!(registry_matches(&registry, &publication)))
+        }
+        "light_client.stats" => {
+            let stats = client.stats();
+            let status = client.status();
+            Ok(json!({
+                "header_bytes": stats.headers,
+                "filter_bytes": stats.filters,
+                "block_bytes": stats.blocks,
+                "blocks_downloaded": stats.blocks_downloaded,
+                "header_height": status.header_height,
+                "filter_height": status.filter_height,
+                "rpa_height": status.rpa_height,
+                "peers": status.peers,
+            }))
         }
         "blockchain.transaction.broadcast_package" => {
             Err(RpcError::not_found("blockchain.transaction.broadcast_package is not available on Bitcoin Cash"))
         }
-        "daemon.passthrough" => Err(RpcError::not_found("there is no node RPC behind this server")),
+        "daemon.passthrough" => Err(RpcError::not_found(
+            "daemon.passthrough is not available: this server is a P2P light client and has no node RPC behind it",
+        )),
         _ => Err(RpcError::not_found(format!("unknown method '{method}'"))),
     }
+}
+
+/// Fulcrum's RPA limits: queries of at least 8 bits, 60 blocks per call.
+const RPA_PREFIX_BITS_MIN: u8 = 8;
+const RPA_HISTORY_BLOCK_LIMIT: u32 = 60;
+const RPA_MAX_HISTORY: usize = 125_000;
+
+fn rpa_prefix_arg(params: &[Value], i: usize) -> Result<Prefix> {
+    let bad = || {
+        RpcError::params(format!(
+            "Invalid prefix argument; expected hex string of at least {} and at most 4 characters",
+            RPA_PREFIX_BITS_MIN / 4
+        ))
+    };
+    let text = arg(params, i).and_then(Value::as_str).ok_or_else(bad)?;
+    let prefix = Prefix::from_hex(text).map_err(|_| bad())?;
+    if prefix.bits < RPA_PREFIX_BITS_MIN {
+        return Err(bad());
+    }
+    Ok(prefix)
+}
+
+fn from_height_arg(params: &[Value], i: usize) -> Result<u32> {
+    arg(params, i)
+        .and_then(Value::as_i64)
+        .filter(|n| *n >= 0)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| RpcError::params("Bad from_height argument"))
+}
+
+fn to_height_arg(params: &[Value], i: usize, from: u32) -> Result<Option<u32>> {
+    match arg(params, i).map(Value::as_i64) {
+        None | Some(Some(-1)) => Ok(None),
+        Some(Some(n)) if n >= i64::from(from) => Ok(Some(u32::try_from(n).unwrap_or(u32::MAX))),
+        _ => Err(RpcError::params("Bad to_height argument")),
+    }
+}
+
+/// Fulcrum's rpa.get_history: from the RPA start height on, at most 60
+/// blocks from `from`, confirmed transactions only.
+async fn rpa_history(
+    client: &LightClient,
+    prefix: Prefix,
+    from: u32,
+    to: Option<u32>,
+) -> Result<Value> {
+    let Some((start, _)) = client.rpa_heights() else {
+        return Err(RpcError::not_found(
+            "RPA support is disabled on this server",
+        ));
+    };
+    if to.is_some_and(|to| to <= from) {
+        return Ok(json!([]));
+    }
+    // Up to the chain's tip: blocks there whose input prefix filters are not
+    // synced yet make the search an error, never an empty answer.
+    let tip = client.tip().map(|t| t.0).unwrap_or(0);
+    let from = from.max(start);
+    let end = to
+        .unwrap_or(tip + 1)
+        .min(tip + 1)
+        .min(from.saturating_add(RPA_HISTORY_BLOCK_LIMIT));
+    if end <= from {
+        return Ok(json!([]));
+    }
+    let found = client.rpa_history(prefix, from, end).await?;
+    if found.len() > RPA_MAX_HISTORY {
+        return Err(RpcError::bad_request(format!(
+            "RPA history too large for prefix '{}'",
+            prefix.to_hex()
+        )));
+    }
+    Ok(json!(found
+        .iter()
+        .filter_map(|m| m
+            .confirmation
+            .map(|c| json!({"tx_hash": m.tx.txid().to_hex(), "height": c.height})))
+        .collect::<Vec<_>>()))
+}
+
+fn hash_arg(params: &[Value], i: usize, what: &str) -> Result<[u8; 32]> {
+    let text = str_arg(params, i, what)?;
+    Txid::from_hex(text)
+        .map(|t| t.0)
+        .map_err(|_| RpcError::params(what.to_string()))
+}
+
+fn category_arg(params: &[Value], i: usize) -> Result<Category> {
+    Category::from_hex(str_arg(params, i, "category")?)
+        .map_err(|_| RpcError::params("Invalid category"))
+}
+
+fn nfts_json(nfts: &[(OutPoint, Nft)]) -> Vec<Value> {
+    nfts.iter()
+        .map(|(outpoint, nft)| {
+            json!({
+                "tx_hash": outpoint.txid.to_hex(),
+                "tx_pos": outpoint.vout,
+                "capability": nft.capability.as_str(),
+                "commitment": hex::encode(&nft.commitment),
+            })
+        })
+        .collect()
+}
+
+/// An authchain as the bridge's light_client.bcmr.* methods answer it.
+fn authchain_json(chain: &Authchain) -> Value {
+    let publication = match &chain.publication {
+        None => Value::Null,
+        Some(Publication::Malformed) => json!({"malformed": true}),
+        Some(Publication::Registry { hash, uris }) => {
+            json!({"hash": hex::encode(hash), "uris": uris})
+        }
+    };
+    json!({
+        "authbase": chain.authbase.to_hex(),
+        "authhead": chain.authhead.txid().to_hex(),
+        "height": chain.authhead_confirmation.map_or(0, |c| c.height),
+        "identity_output": {"tx_hash": chain.identity_output.txid.to_hex(), "tx_pos": chain.identity_output.vout},
+        "burned": chain.burned,
+        "publication": publication,
+        "claims": chain.claims.iter().map(hex::encode).collect::<Vec<_>>(),
+        "steps": chain.steps.iter().map(|(txid, height)| json!({"tx_hash": txid.to_hex(), "height": height.unwrap_or(0)})).collect::<Vec<_>>(),
+    })
+}
+
+/// A proof as Fulcrum shows one: IDs in display order.
+pub fn dsproof_json(p: &DsProofInfo) -> Value {
+    json!({
+        "dspid": reversed_hex(&p.id),
+        "txid": p.txid.to_hex(),
+        "hex": hex::encode(&p.raw),
+        "outpoint": {"txid": p.outpoint.txid.to_hex(), "vout": p.outpoint.vout},
+        "descendants": p.descendants.iter().map(|t| t.to_hex()).collect::<Vec<_>>(),
+    })
 }
 
 fn target_of(session: &Session, method: &str, params: &[Value]) -> Result<(Target, String)> {
