@@ -17,14 +17,17 @@ Most Bitcoin Cash wallets ask an Electrum server such as Fulcrum about their add
 | Server-side storage | an address index that grows with the chain | none: nodes serve filters built from their blocks |
 | Who can serve | servers that run the indexer | any node that serves compact filters |
 
-Measured side by side on the same regtest chain (Fulcrum 2.1.4 on BCHN; the bridge on a Knuth node serving filters; [run 44618265629](https://github.com/BitcoinCash1/knuth-bch-startos/actions/runs/44618265629)):
+Measured side by side on the same regtest chain of 2,226 blocks (Fulcrum 2.1.4 on BCHN; the bridge with its default protections on a Knuth node serving filters; [run 44638120561](https://github.com/BitcoinCash1/knuth-bch-startos/actions/runs/44638120561)):
 
 | | Fulcrum | bch-light-client |
 |---|---|---|
-| Storage | 2,813,803 bytes | 603,734 bytes from genesis, 227,621 from a wallet birthday |
+| Storage | 2,813,733 bytes | 447,698 bytes from genesis, 209,636 from a wallet birthday |
 | Sync | 1.0 s | 0.5 s |
-| Downloaded to answer | at least 829,102 bytes of block data | 316,256 bytes from genesis |
+| Downloaded to answer | at least 829,102 bytes of block data | 685,665 bytes from genesis: headers, filters, and every block, which the RPA searches over the whole chain read |
 | Electrum answers | — | 174 of 187 calls equal to Fulcrum's; the other 13 differ on purpose (listed in the harness) |
+| A new block notified | 22–522 ms | 39.5 s, waiting on Knuth, which took 39 s to get the block |
+
+The bridge takes new blocks' headers only from nodes that serve filters. The Knuth build used asks a peer that serves no blocks (a light client) for each new block, and waits out a 15-second timeout before it asks BCHN. When it asks BCHN first, the bridge notifies in about 2 s (runs 44308280874 and 44618265629).
 
 ## What it does
 
