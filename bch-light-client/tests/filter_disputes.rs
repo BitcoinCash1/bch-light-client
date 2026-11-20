@@ -163,6 +163,9 @@ async fn a_wrong_input_prefix_filter_does_not_stop_histories() {
     config.request_timeout = Duration::from_secs(10);
     config.learn_peers = false;
     config.rpa_filters = true;
+    // The only peer is banned, so the history can read only the block it
+    // already holds: no decoys here (tests/cover.rs tests them).
+    config.decoy_blocks = 0;
     let client = LightClient::start(config).await.expect("start client");
     let target = bch_light_client::Target::Script(key.script());
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -352,6 +355,8 @@ async fn an_rpa_search_past_the_input_prefix_filters_is_an_error() {
     config.request_timeout = Duration::from_secs(10);
     config.learn_peers = false;
     config.rpa_filters = true;
+    // Searched by the input prefix filters, not by whole ranges.
+    config.rpa_whole_ranges = false;
     let client = LightClient::start(config).await.expect("start client");
     client
         .wait_synced(Duration::from_secs(60))
@@ -382,6 +387,8 @@ async fn more_cover_prefixes_than_exist_still_search() {
     config.request_timeout = Duration::from_secs(10);
     config.learn_peers = false;
     config.rpa_filters = true;
+    // Searched by the input prefix filters, not by whole ranges.
+    config.rpa_whole_ranges = false;
     config.rpa_cover_prefixes = 1000;
     let client = LightClient::start(config).await.expect("start client");
     let deadline = Instant::now() + Duration::from_secs(60);

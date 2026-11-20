@@ -17,28 +17,58 @@ Most Bitcoin Cash wallets ask an Electrum server such as Fulcrum about their add
 | Server-side storage | an address index that grows with the chain | none: nodes serve filters built from their blocks |
 | Who can serve | servers that run the indexer | any node that serves compact filters |
 
-Measured side by side on the same regtest chain (Fulcrum 2.1.4 on BCHN; the bridge on a Knuth node serving filters; [run 44618265629](https://github.com/BitcoinCash1/knuth-bch-startos/actions/runs/44618265629)):
+Measured side by side on the same regtest chain of 2,226 blocks (Fulcrum 2.1.4 on BCHN; the bridge with its default protections on a Knuth node serving filters; [run 44638120561](https://github.com/BitcoinCash1/knuth-bch-startos/actions/runs/44638120561)):
 
 | | Fulcrum | bch-light-client |
 |---|---|---|
-| Storage | 2,813,803 bytes | 603,734 bytes from genesis, 227,621 from a wallet birthday |
+| Storage | 2,813,733 bytes | 447,698 bytes from genesis, 209,636 from a wallet birthday |
 | Sync | 1.0 s | 0.5 s |
-| Downloaded to answer | at least 829,102 bytes of block data | 316,256 bytes from genesis |
+| Downloaded to answer | at least 829,102 bytes of block data | 685,665 bytes from genesis: headers, filters, and every block, which the RPA searches over the whole chain read |
 | Electrum answers | — | 174 of 187 calls equal to Fulcrum's; the other 13 differ on purpose (listed in the harness) |
+| A new block notified | 22–522 ms | 39.5 s, waiting on Knuth, which took 39 s to get the block |
+
+The bridge takes new blocks' headers only from nodes that serve filters. The Knuth build used asks a peer that serves no blocks (a light client) for each new block, and waits out a 15-second timeout before it asks BCHN. When it asks BCHN first, the bridge notifies in about 2 s (runs 44308280874 and 44618265629).
 
 ## What it does
 
 - **Histories, balances and unspent outputs** of scripts and addresses (P2PKH, P2SH20, P2SH32, bare scripts), with token data and a token filter.
 - **CashTokens:** balances per category, supply (total, reserved, circulating) and genesis, all from the filters with no index.
 - **BCMR:** authchains resolved and followed spend by spend, a registry's `authchain` extension checked, and a registry's bytes checked against its published hash. The client never fetches a registry: the wallet downloads it and asks the client to check it.
-- **Reusable payment addresses (RPA):** input prefix filters (filter type 2) and lookups by prefix.
+- **Reusable payment addresses (RPA):** lookups by prefix that read every block of the range, so no prefix shows; input prefix filters (filter type 2) as an option.
 - **Lookups by transaction ID alone**, through the transaction keys in the script filters.
 - **Unconfirmed transactions** from relay, and **double-spend proofs** checked against the coins the client holds.
 - **Broadcast.**
 - **Wallet birthday:** a restore downloads filters only from the wallet's own years.
 - **Reorganizations:** filters and histories roll back to the fork.
 - **Disputes between peers** settled by downloading the block, and the lying peer refused.
-- **Tor:** with a SOCKS5 proxy, each block comes over a circuit of its own.
+- **Privacy by default:** each block and each broadcast over a connection of its own (with Tor, a circuit of its own), decoys derived for each needed block, and Bitcoin Cash Node's user agent. See below for what it costs.
+
+## Privacy by default, and what it costs
+
+A peer that serves a block learns that someone wanted it. That is the one thing a wallet's lookups show, and the defaults hide it. Nothing has to be turned on:
+
+- **Each block over a connection of its own.** The peers that serve headers and filters do not see which blocks follow, and no peer sees two blocks asked for over one connection. Through Tor, each connection is a circuit of its own. A broadcast goes over a connection of its own too.
+- **Three decoys per needed block.**
+  - The decoys come from the block's bucket of 144 heights: SHA-256 of a seed kept in the data folder, the height and the draw.
+  - The same block brings the same decoys in every session, so a peer that intersects several sessions learns nothing new.
+  - The bucket at the tip, not complete yet, is downloaded whole.
+- **The same cover on every lookup.** This covers histories, transactions by ID or by position, output spends, token geneses and identity spenders. A transaction found once is kept, so asking again downloads nothing.
+- **RPA searches read their whole range**, so which blocks they read names no prefix.
+- **Bitcoin Cash Node's user agent** (`/Bitcoin Cash Node:29.2.0/`), the most common one on the network. A name of its own would mark every connection as this client.
+
+What it costs, measured by the `what_the_cover_costs` test as bytes a node sent for one operation, on regtest blocks of about 300 bytes:
+
+| Operation | Defaults | Decoys and isolation off |
+|---|---|---|
+| A history needing 3 blocks: two in one bucket, one in the bucket at the tip | 23,141 bytes, 20 blocks | 882 bytes, 3 blocks |
+| A transaction by ID | 4,750 bytes, 4 blocks | 294 bytes, 1 block |
+| An RPA search of 60 blocks | 68,727 bytes, 60 blocks | 294 bytes, the one matching block |
+
+On regtest these numbers are mostly handshakes: each connection of its own costs about 900 bytes. On mainnet the blocks dominate:
+- Each needed block costs four blocks. One in the bucket at the tip costs that bucket, up to 144 blocks.
+- An RPA search costs every block of its range.
+
+With blocks of 300 KB, a history that touches 100 blocks downloads about 120 MB instead of 30 MB, once. A 60-block RPA search downloads about 18 MB, whatever the prefix. That is the price of a peer learning nothing.
 
 ## Crates
 
@@ -65,7 +95,7 @@ let coins = client.unspent(&target, TokenFilter::Include).await?;
 let mut events = client.subscribe(); // new blocks, payments, double-spend proofs
 ```
 
-The crate documentation (`cargo doc --open`) explains what peers can and cannot learn, and the `Config` options that limit it: a proxy, isolated block downloads, decoy blocks, downloading every block of a range, and cover prefixes for RPA.
+The crate documentation (`cargo doc --open`) explains what peers can and cannot learn, and the `Config` options behind it. The protections are on by default, so nothing has to be set.
 
 ## Running the bridge
 
@@ -73,11 +103,11 @@ The crate documentation (`cargo doc --open`) explains what peers can and cannot 
 cargo run --release -p bch-electrum-bridge -- --network mainnet --datadir ~/.bch-bridge --peer node1.example:8333 --peer node2.example:8333 --listen 127.0.0.1:50001
 ```
 
-Point the wallet at `127.0.0.1:50001`. The bridge refuses any address that is not loopback: it serves wallets on the same machine, never a network. More options (`--proxy`, `--birthday`, `--decoy-blocks`, `--download-all-blocks`, `--dns-seeds`, RPA settings) are in `--help` and in the [bridge README](bch-electrum-bridge/README.md).
+Point the wallet at `127.0.0.1:50001`. The bridge refuses any address that is not loopback: it serves wallets on the same machine, never a network. More options (`--proxy`, `--birthday`, `--download-all-blocks`, `--dns-seeds`, and the settings that weaken the default protections) are in `--help` and in the [bridge README](bch-electrum-bridge/README.md).
 
 ## Which nodes serve the filters
 
-The client needs at least one node that serves script filters (filter type 1, with transaction keys). Input prefix filters (type 2) are needed for RPA. Both formats are open pull requests, so today they come from the branches of those PRs:
+The client needs at least one node that serves script filters (filter type 1, with transaction keys). Input prefix filters (type 2) are optional: RPA searches read whole ranges by default. Both formats are open pull requests, so today they come from the branches of those PRs:
 
 - **Knuth:** k-nuth/kth#1002, #1003, #1004 (type 1) and #1013 (type 2).
 - **BCHD:** gcash/bchd#776, #777, #778 (type 1) and #785 (type 2).

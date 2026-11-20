@@ -669,7 +669,35 @@ pub async fn all_blocks(node: &Bchd) -> Vec<Value> {
 /// and checksum are made to fit). What the client sends passes unchanged.
 pub struct TamperProxy {
     pub port: u16,
+    /// Bytes the node sent the client through the proxy, headers included.
+    pub delivered: std::sync::Arc<std::sync::atomic::AtomicU64>,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// A message a client sent through a [`TamperProxy::recording`].
+#[derive(Debug, Clone)]
+pub struct Sent {
+    /// The proxy's count of the connection it came over, from 0.
+    pub connection: usize,
+    pub command: String,
+    pub payload: Vec<u8>,
+}
+
+/// Whether an inv or getdata payload lists a block, and which.
+pub fn inv_blocks(payload: &[u8]) -> Vec<[u8; 32]> {
+    let (start, count) = match payload.first() {
+        Some(0xfd) if payload.len() >= 3 => {
+            (3, usize::from(u16::from_le_bytes([payload[1], payload[2]])))
+        }
+        Some(&n) if n < 0xfd => (1, usize::from(n)),
+        _ => return Vec::new(),
+    };
+    (0..count)
+        .filter_map(|i| {
+            let item = payload.get(start + i * 36..start + i * 36 + 36)?;
+            (item[..4] == 2u32.to_le_bytes()).then(|| item[4..].try_into().unwrap())
+        })
+        .collect()
 }
 
 impl Drop for TamperProxy {
@@ -692,7 +720,7 @@ impl TamperProxy {
         node_port: u16,
         rewrite: impl Fn(&mut String, &mut Vec<u8>) + Send + Sync + 'static,
     ) -> TamperProxy {
-        Self::full(node_port, rewrite, |_: &str, _: &[u8]| {}).await
+        Self::full(node_port, rewrite, |_: usize, _: &str, _: &[u8]| {}).await
     }
 
     /// Passes everything unchanged, and shows `observe` every message the
@@ -701,7 +729,34 @@ impl TamperProxy {
         node_port: u16,
         observe: impl Fn(&str, &[u8]) + Send + Sync + 'static,
     ) -> TamperProxy {
-        Self::full(node_port, |_: &mut String, _: &mut Vec<u8>| {}, observe).await
+        Self::full(
+            node_port,
+            |_: &mut String, _: &mut Vec<u8>| {},
+            move |_: usize, command: &str, payload: &[u8]| observe(command, payload),
+        )
+        .await
+    }
+
+    /// Passes everything unchanged, and keeps every message the client
+    /// sends, with the connection it came over.
+    pub async fn recording(
+        node_port: u16,
+    ) -> (TamperProxy, std::sync::Arc<std::sync::Mutex<Vec<Sent>>>) {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sent.clone();
+        let proxy = Self::full(
+            node_port,
+            |_: &mut String, _: &mut Vec<u8>| {},
+            move |connection: usize, command: &str, payload: &[u8]| {
+                log.lock().unwrap().push(Sent {
+                    connection,
+                    command: command.to_string(),
+                    payload: payload.to_vec(),
+                })
+            },
+        )
+        .await;
+        (proxy, sent)
     }
 
     /// Passes everything but the node's block announcements: a headers
@@ -728,7 +783,7 @@ impl TamperProxy {
                     *command = "announcement".into();
                 }
             },
-            move |command: &str, _: &[u8]| {
+            move |_: usize, command: &str, _: &[u8]| {
                 if command == "getheaders" {
                     *asked.lock().unwrap() += 1;
                 }
@@ -740,14 +795,20 @@ impl TamperProxy {
     async fn full(
         node_port: u16,
         rewrite: impl Fn(&mut String, &mut Vec<u8>) + Send + Sync + 'static,
-        observe: impl Fn(&str, &[u8]) + Send + Sync + 'static,
+        observe: impl Fn(usize, &str, &[u8]) + Send + Sync + 'static,
     ) -> TamperProxy {
         let rewrite = std::sync::Arc::new(rewrite);
+        let delivered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = delivered.clone();
         let observe = std::sync::Arc::new(observe);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let task = tokio::spawn(async move {
+            let mut connections = 0usize;
             while let Ok((client, _)) = listener.accept().await {
+                let connection = connections;
+                connections += 1;
+                let counter = counter.clone();
                 let Ok(node) = TcpStream::connect(("127.0.0.1", node_port)).await else {
                     continue;
                 };
@@ -768,7 +829,7 @@ impl TamperProxy {
                         let command = String::from_utf8_lossy(&head[4..16])
                             .trim_end_matches('\0')
                             .to_string();
-                        observe(&command, &payload);
+                        observe(connection, &command, &payload);
                         if to_node.write_all(&head).await.is_err()
                             || to_node.write_all(&payload).await.is_err()
                         {
@@ -797,6 +858,10 @@ impl TamperProxy {
                         head[4..16].copy_from_slice(&name);
                         head[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
                         head[20..24].copy_from_slice(&hash256(&payload)[..4]);
+                        counter.fetch_add(
+                            (head.len() + payload.len()) as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         if to_client.write_all(&head).await.is_err()
                             || to_client.write_all(&payload).await.is_err()
                         {
@@ -806,7 +871,11 @@ impl TamperProxy {
                 });
             }
         });
-        TamperProxy { port, task }
+        TamperProxy {
+            port,
+            delivered,
+            task,
+        }
     }
 
     pub fn peer(&self) -> String {

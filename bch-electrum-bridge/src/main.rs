@@ -24,14 +24,23 @@ Options:
   --peer HOST:PORT        a node; repeat for more. Those that serve script filters
                           (filter type 1) give filters; the others relay transactions,
                           their mempool and double-spend proofs
-  --proxy HOST:PORT       a SOCKS5 proxy such as Tor; blocks then come over circuits of their own
-  --isolate-blocks        fetch each block over a connection of its own even without a proxy
-  --decoy-blocks N        fetch N random extra blocks with each block a scan needs
+  --proxy HOST:PORT       a SOCKS5 proxy such as Tor
+  --no-block-isolation    fetch blocks and send broadcasts over the long-lived connections
+                          (default: each over a connection of its own, through a proxy a
+                          circuit of its own, so no peer sees two blocks fetched by one client)
+  --decoy-blocks N        decoys fetched with each block a lookup needs (default 3), from
+                          its bucket of 144 heights and the same in every session
   --download-all-blocks   fetch every block of a scanned range: which blocks are fetched says nothing
   --birthday HEIGHT       keep filters, and read histories, from this height on (default: genesis)
-  --no-rpa                do not keep input prefix filters (blockchain.rpa.* then answer method not found)
-  --rpa-from HEIGHT       where input prefix filters start (default: the network's RPA start, or the birthday)
-  --rpa-cover N           with each RPA search also fetch the blocks of N random other prefixes
+  --no-rpa                blockchain.rpa.* answer method not found
+  --rpa-filters           keep input prefix filters and search RPA ranges by them: fewer blocks,
+                          but which blocks are fetched depends on the prefix (default: every
+                          block of the range, which names no prefix)
+  --rpa-from HEIGHT       where RPA searches and input prefix filters start (default: the
+                          network's RPA start, or the birthday)
+  --rpa-cover N           with --rpa-filters, also fetch the blocks of N random other prefixes
+  --user-agent TEXT       the user agent sent to nodes (default: Bitcoin Cash Node's current
+                          release, the most common one, so the bridge is not named)
   --dns-seeds             also find nodes through the network's DNS seeds (not used behind a proxy)
   --listen ADDR:PORT      where wallets on this machine connect: a loopback address
                           only (default 127.0.0.1:50001)
@@ -45,6 +54,8 @@ pub struct Options {
     pub listen: Vec<SocketAddr>,
     pub banner: String,
     pub donation_address: String,
+    /// Whether blockchain.rpa.* are answered.
+    pub rpa: bool,
 }
 
 /// The addresses of `listen`, which must all be loopback: the bridge serves
@@ -68,11 +79,13 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
     let mut datadir = "bch-bridge-data".to_string();
     let mut peers = Vec::new();
     let mut proxy = None;
-    let mut isolate = None;
-    let mut decoys = 0usize;
+    let mut isolate = true;
+    let mut decoys = 3usize;
     let mut all_blocks = false;
     let mut birthday = 0u32;
     let mut rpa = true;
+    let mut rpa_filters = false;
+    let mut user_agent = None;
     let mut rpa_from = None;
     let mut rpa_cover = 0usize;
     let mut dns_seeds = false;
@@ -87,7 +100,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
             "--datadir" => datadir = value("--datadir")?,
             "--peer" => peers.push(value("--peer")?),
             "--proxy" => proxy = Some(value("--proxy")?),
-            "--isolate-blocks" => isolate = Some(true),
+            "--no-block-isolation" => isolate = false,
             "--decoy-blocks" => {
                 decoys = value("--decoy-blocks")?
                     .parse()
@@ -100,6 +113,8 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                     .map_err(|_| "--birthday needs a height")?
             }
             "--no-rpa" => rpa = false,
+            "--rpa-filters" => rpa_filters = true,
+            "--user-agent" => user_agent = Some(value("--user-agent")?),
             "--rpa-from" => {
                 rpa_from = Some(
                     value("--rpa-from")?
@@ -126,12 +141,16 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
     let listen = loopback(&listen)?;
     let mut config = Config::new(network, datadir, peers);
     config.proxy = proxy;
-    config.isolate_block_downloads = isolate.or(config.isolate_block_downloads);
+    config.isolate_block_downloads = isolate;
     config.decoy_blocks = decoys;
     config.download_all_blocks = all_blocks;
     config.filters_from_height = birthday;
-    config.rpa_filters = rpa;
+    config.rpa_filters = rpa && rpa_filters;
+    config.rpa_whole_ranges = !rpa_filters;
     config.rpa_from_height = rpa_from;
+    if let Some(user_agent) = user_agent {
+        config.user_agent = user_agent;
+    }
     config.rpa_cover_prefixes = rpa_cover;
     config.dns_seeds = dns_seeds;
     if banner.is_empty() {
@@ -142,6 +161,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         listen,
         banner,
         donation_address,
+        rpa,
     })
 }
 
@@ -197,6 +217,7 @@ async fn main() {
         network,
         banner: options.banner,
         donation_address: options.donation_address,
+        rpa: options.rpa,
     });
     loop {
         match listener.accept().await {
@@ -234,6 +255,29 @@ mod tests {
         assert_eq!(o.config.network, Network::Regtest);
         assert_eq!(o.config.proxy.as_deref(), Some("127.0.0.1:9050"));
         assert_eq!(o.config.decoy_blocks, 2);
+        // The protections are on unless turned off.
+        assert!(o.config.isolate_block_downloads);
+        assert!(o.config.rpa_whole_ranges && !o.config.rpa_filters);
+        assert_eq!(o.config.user_agent, bch_light_client::DEFAULT_USER_AGENT);
+        let defaults = parse_args(vec!["--peer".into(), "127.0.0.1:1".into()]).unwrap();
+        assert_eq!(defaults.config.decoy_blocks, 3);
+        let off = parse_args(
+            [
+                "--peer",
+                "127.0.0.1:1",
+                "--no-block-isolation",
+                "--rpa-filters",
+                "--user-agent",
+                "/x:1/",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        )
+        .unwrap();
+        assert!(!off.config.isolate_block_downloads);
+        assert!(off.config.rpa_filters && !off.config.rpa_whole_ranges);
+        assert_eq!(off.config.user_agent, "/x:1/");
         assert!(parse_args(vec![]).is_err());
         assert!(ABOUT.contains("do not support the Bitcoin Cash P2P protocol"));
         assert_eq!(o.listen, vec!["127.0.0.1:50001".parse().unwrap()]);

@@ -8,6 +8,7 @@
 //! spending it holds. Blocks are downloaded with the configured decoys, as
 //! for histories; nothing names a category or an identity to a peer.
 
+use super::cover::blocks_with_cover;
 use super::*;
 use crate::bcmr::{self, Publication};
 use crate::tx::{Category, Nft, NftCapability};
@@ -147,39 +148,6 @@ pub fn balances_of(utxos: &[Utxo]) -> Vec<CategoryBalance> {
         }
     }
     out
-}
-
-/// The blocks at `heights`, fetched with `Config::decoy_blocks` random
-/// others for each, so that which blocks were wanted is not shown.
-async fn blocks_with_cover(inner: &Arc<Inner>, heights: &[u32]) -> Result<Vec<(u32, Arc<Block>)>> {
-    let (base, tip) = {
-        let store = inner.filters.read().expect("filters lock");
-        (store.base(), store.tip())
-    };
-    let mut fetch: BTreeSet<u32> = heights.iter().copied().collect();
-    if let Some(tip) = tip.filter(|t| *t >= base) {
-        let mut rng = rand::thread_rng();
-        for _ in 0..heights.len() * inner.config.decoy_blocks {
-            fetch.insert(rng.gen_range(base..=tip));
-        }
-    }
-    let tasks: Vec<(u32, JoinHandle<Result<Arc<Block>>>)> = fetch
-        .into_iter()
-        .map(|h| {
-            let inner = inner.clone();
-            (h, tokio::spawn(async move { block_at(&inner, h).await }))
-        })
-        .collect();
-    let mut out = Vec::new();
-    for (height, task) in tasks {
-        let block = task
-            .await
-            .map_err(|e| Error::new(ErrorKind::Stopped, e.to_string()))??;
-        if heights.contains(&height) {
-            out.push((height, block));
-        }
-    }
-    Ok(out)
 }
 
 const IDENTITIES_FILE: &str = "identities.dat";

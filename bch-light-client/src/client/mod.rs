@@ -34,8 +34,10 @@ use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+mod cover;
 mod dsproofs;
 mod filters;
+mod found;
 mod persist;
 mod rpa_search;
 mod tokens;
@@ -44,7 +46,17 @@ use filters::{store_base, FilterKind};
 pub use rpa_search::RpaMatch;
 pub use tokens::{balances_of, supply_of, Authchain, CategoryBalance, TokenHolding, TokenSupply};
 
-/// How the client reaches the network and how much it downloads.
+/// The user agent the client sends: Bitcoin Cash Node's current release,
+/// the most common one on the network. A user agent of its own would mark
+/// every connection as this client and tie its connections together.
+/// Other fields of the version message still differ from a full node's
+/// (no services, no address), so a peer can tell that a light client
+/// connected, but not which software, nor link it by name.
+pub const DEFAULT_USER_AGENT: &str = "/Bitcoin Cash Node:29.2.0/";
+
+/// How the client reaches the network and how much it downloads. The
+/// defaults protect: nothing has to be turned on (see the crate docs for
+/// what each protection costs).
 #[derive(Debug, Clone)]
 pub struct Config {
     pub network: Network,
@@ -54,10 +66,16 @@ pub struct Config {
     pub peers: Vec<String>,
     /// A SOCKS5 proxy (`host:port`), such as Tor's.
     pub proxy: Option<String>,
-    /// Download each block over a connection of its own (with a proxy, a
-    /// circuit of its own). Default: on when a proxy is set.
-    pub isolate_block_downloads: Option<bool>,
-    /// Random extra blocks downloaded with each block a scan needs.
+    /// Download each block, and send each broadcast, over a connection of
+    /// its own (through a proxy, a circuit of its own): the peers that serve
+    /// headers and filters do not see which blocks follow, and no peer sees
+    /// two blocks asked for by one client. Default: on.
+    pub isolate_block_downloads: bool,
+    /// Decoys downloaded with each block a lookup needs, from the block's
+    /// bucket of 144 heights and derived from the data folder's seed, so
+    /// that the same block brings the same decoys in every session. A block
+    /// in the bucket at the tip, not complete yet, brings the whole bucket.
+    /// Default: 3.
     pub decoy_blocks: usize,
     /// Download every block of a scanned range, not only those the filters
     /// point to: peers learn nothing from which blocks are fetched.
@@ -68,6 +86,7 @@ pub struct Config {
     pub parallel_downloads: usize,
     /// Threads that match filters; 0 for one per core.
     pub scan_threads: usize,
+    /// Default: [`DEFAULT_USER_AGENT`].
     pub user_agent: String,
     /// How long a request may wait with nothing arriving.
     pub request_timeout: Duration,
@@ -81,8 +100,14 @@ pub struct Config {
     /// Where input prefix filters start; by default the network's usual RPA
     /// start height, or the birthday when that is later.
     pub rpa_from_height: Option<u32>,
-    /// Random other prefixes whose blocks an RPA search also downloads, so
-    /// a peer that sees the downloads cannot tell which prefix is the wallet's.
+    /// Search RPA ranges by downloading every block of the range: which
+    /// blocks are read then names no prefix, and no input prefix filters
+    /// are needed. Off, a search reads the blocks whose input prefix
+    /// filters match (needs `rpa_filters`), with `rpa_cover_prefixes`
+    /// others. Default: on.
+    pub rpa_whole_ranges: bool,
+    /// With `rpa_whole_ranges` off: random other prefixes whose blocks an
+    /// RPA search also downloads.
     pub rpa_cover_prefixes: usize,
     /// Look up peers from the network's DNS seeds (not through a proxy).
     pub dns_seeds: bool,
@@ -97,19 +122,20 @@ impl Config {
             data_dir: data_dir.into(),
             peers,
             proxy: None,
-            isolate_block_downloads: None,
-            decoy_blocks: 0,
+            isolate_block_downloads: true,
+            decoy_blocks: 3,
             download_all_blocks: false,
             service_peers: 2,
             parallel_downloads: 4,
             scan_threads: 0,
-            user_agent: format!("/bch-light-client:{}/", env!("CARGO_PKG_VERSION")),
+            user_agent: DEFAULT_USER_AGENT.to_string(),
             request_timeout: Duration::from_secs(60),
             block_cache_bytes: 64 << 20,
             mempool_max_bytes: 256 << 20,
             filters_from_height: 0,
             rpa_filters: false,
             rpa_from_height: None,
+            rpa_whole_ranges: true,
             rpa_cover_prefixes: 0,
             dns_seeds: false,
             learn_peers: true,
@@ -348,6 +374,10 @@ struct Inner {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// The network's data folder.
     dir: PathBuf,
+    /// The seed decoys are derived from, kept in the data folder.
+    seed: [u8; 32],
+    /// Transactions found by lookups, and outputs checked for a spender.
+    found: Mutex<found::Found>,
     generation: AtomicU64,
     targets: Mutex<HashMap<FilterKey, TargetState>>,
     mempool: RwLock<Mempool>,
@@ -366,7 +396,7 @@ struct Inner {
     /// when: a relay peer may announce a block before the nodes that serve
     /// filters have it, and they may never announce it.
     announced_block: Mutex<Option<(BlockHash, std::time::Instant)>>,
-    requested: Mutex<HashSet<Txid>>,
+    requested: Mutex<Requested>,
     shutdown: watch::Sender<bool>,
 }
 
@@ -428,9 +458,8 @@ impl LightClient {
             filters = filters.len(),
             "stores opened"
         );
-        let isolate = config
-            .isolate_block_downloads
-            .unwrap_or(config.proxy.is_some());
+        let isolate = config.isolate_block_downloads;
+        let seed = cover::load_seed(&dir).map_err(|e| storage_error("decoy seed", e))?;
         let options = PeerOptions {
             magic: params.magic,
             user_agent: config.user_agent.clone(),
@@ -476,6 +505,8 @@ impl LightClient {
             identities: Mutex::new(tokens::load_identities(&dir)),
             tasks: Mutex::new(Vec::new()),
             dir: dir.clone(),
+            seed,
+            found: Mutex::new(found::Found::default()),
             generation: AtomicU64::new(0),
             targets: Mutex::new(watched),
             mempool: RwLock::new(Mempool::new(config.mempool_max_bytes)),
@@ -496,7 +527,7 @@ impl LightClient {
             live_tip: Mutex::new(None),
             announced_tip: Mutex::new(None),
             announced_block: Mutex::new(None),
-            requested: Mutex::new(HashSet::new()),
+            requested: Mutex::new(Requested::default()),
             shutdown,
             config,
         });
@@ -821,8 +852,9 @@ impl LightClient {
 
     // ---- transactions
 
-    /// A transaction by ID: from the mempool, from a watched history, from
-    /// the block at `height_hint`, or by its transaction key in the filters.
+    /// A transaction by ID: from the mempool, from the transactions found
+    /// before, from a watched history, from the block at `height_hint`, or
+    /// by its transaction key in the filters. Blocks come with their cover.
     pub async fn transaction(&self, txid: Txid, height_hint: Option<u32>) -> Result<TxInfo> {
         if let Some(entry) = self.inner.mempool.read().expect("mempool lock").get(&txid) {
             return Ok(TxInfo {
@@ -830,34 +862,16 @@ impl LightClient {
                 confirmation: None,
             });
         }
-        let (block, height) = locate(&self.inner, txid, height_hint).await?;
-        let position = block
-            .txs
-            .iter()
-            .position(|t| t.txid() == txid)
-            .expect("located");
+        let found = locate(&self.inner, txid, height_hint).await?;
         Ok(TxInfo {
-            tx: block.txs[position].clone(),
-            confirmation: Some(Confirmation {
-                height,
-                block_hash: block.hash(),
-                position: position as u32,
-            }),
+            tx: found.tx.clone(),
+            confirmation: Some(found.confirmation),
         })
     }
 
     /// The Merkle branch of a confirmed transaction.
     pub async fn merkle_proof(&self, txid: Txid, height_hint: Option<u32>) -> Result<MerkleProof> {
-        let (block, height) = locate(&self.inner, txid, height_hint).await?;
-        let leaves: Vec<[u8; 32]> = block.txs.iter().map(|t| t.txid().0).collect();
-        let position = leaves.iter().position(|l| *l == txid.0).expect("located");
-        Ok(MerkleProof {
-            txid,
-            height,
-            block_hash: block.hash(),
-            position: position as u32,
-            branch: merkle_branch(&leaves, position),
-        })
+        Ok(locate(&self.inner, txid, height_hint).await?.proof())
     }
 
     /// The transaction at `position` of the block at `height`, with its Merkle branch.
@@ -866,22 +880,18 @@ impl LightClient {
         height: u32,
         position: u32,
     ) -> Result<(Transaction, MerkleProof)> {
-        let block = block_at(&self.inner, height).await?;
-        let tx = block.txs.get(position as usize).cloned().ok_or_else(|| {
-            Error::new(
+        if let Some(found) = self.inner.found_at(height, position) {
+            return Ok((found.tx.clone(), found.proof()));
+        }
+        let block = cover::block_with_cover(&self.inner, height).await?;
+        if position as usize >= block.txs.len() {
+            return Err(Error::new(
                 ErrorKind::NotFound,
                 format!("no transaction at position {position} of block {height}"),
-            )
-        })?;
-        let leaves: Vec<[u8; 32]> = block.txs.iter().map(|t| t.txid().0).collect();
-        let proof = MerkleProof {
-            txid: tx.txid(),
-            height,
-            block_hash: block.hash(),
-            position,
-            branch: merkle_branch(&leaves, position as usize),
-        };
-        Ok((tx, proof))
+            ));
+        }
+        let found = self.inner.keep_found(&block, height, position as usize);
+        Ok((found.tx.clone(), found.proof()))
     }
 
     /// An unspent output by outpoint, or None when it is spent.
@@ -928,17 +938,35 @@ impl LightClient {
                 "an output without a filtered script or token cannot be followed",
             ));
         };
-        let heights = matching_heights(&self.inner, key, confirmation.height).await?;
+        // Asked before: from where that look stopped.
+        let from = match self.inner.spend_checked(&outpoint) {
+            Some((_, true)) => return Ok(None),
+            Some((through, false)) => through + 1,
+            None => confirmation.height,
+        };
+        let through = {
+            let tip = self.inner.filters.read().expect("filters lock").tip();
+            tip.and_then(|t| {
+                let hash = self.inner.chain.read().expect("chain lock").hash_at(t)?;
+                Some((t, hash))
+            })
+        };
+        let heights = matching_heights(&self.inner, key, from).await?;
         for height in heights {
-            let block = block_at(&self.inner, height).await?;
+            let block = cover::block_with_cover(&self.inner, height).await?;
             if block
                 .txs
                 .iter()
                 .skip(1)
                 .any(|t| t.inputs.iter().any(|i| i.prevout == outpoint))
             {
+                self.inner
+                    .keep_spend_check(outpoint, height, block.hash(), true);
                 return Ok(None);
             }
+        }
+        if let Some((tip, hash)) = through {
+            self.inner.keep_spend_check(outpoint, tip, hash, false);
         }
         Ok(Some(result))
     }
@@ -1053,9 +1081,7 @@ impl LightClient {
 
 impl Inner {
     fn fetcher_isolates(&self) -> bool {
-        self.config
-            .isolate_block_downloads
-            .unwrap_or(self.config.proxy.is_some())
+        self.config.isolate_block_downloads
     }
 
     fn emit(&self, event: Event) {
@@ -1231,14 +1257,12 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
                 wanted.extend({
                     let mempool = inner.mempool.read().expect("mempool lock");
                     let mut requested = inner.requested.lock().expect("requested lock");
-                    if requested.len() > 100_000 {
-                        requested.clear();
-                    }
                     items
                         .iter()
                         .filter(|i| i.kind == INV_TX)
                         .filter(|i| {
-                            !mempool.contains(&Txid(i.hash)) && requested.insert(Txid(i.hash))
+                            !mempool.contains(&Txid(i.hash))
+                                && requested.announced(Txid(i.hash), peer)
                         })
                         .copied()
                         .collect::<Vec<Inv>>()
@@ -1274,8 +1298,29 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<PeerEvent>) {
                         .requested
                         .lock()
                         .expect("requested lock")
-                        .remove(&tx.txid());
+                        .arrived(&tx.txid());
                     on_mempool_tx(&inner, tx);
+                }
+            }
+            // A peer that will not serve a transaction it announced: ask
+            // the next peer that announced it, if any.
+            "notfound" => {
+                let Ok(items) = decode_inv(&message.payload) else {
+                    continue;
+                };
+                let next: Vec<(u64, Inv)> = {
+                    let mut requested = inner.requested.lock().expect("requested lock");
+                    items
+                        .iter()
+                        .filter(|i| i.kind == INV_TX)
+                        .filter_map(|i| requested.not_found(Txid(i.hash)).map(|p| (p, *i)))
+                        .collect()
+                };
+                let peers = inner.pool.peers();
+                for (next_peer, item) in next {
+                    if let Some(p) = peers.iter().find(|p| p.id == next_peer) {
+                        p.send("getdata", encode_inv(&[item]));
+                    }
                 }
             }
             "feefilter" => {
@@ -1379,6 +1424,51 @@ fn awaiting_announced(inner: &Inner) -> bool {
         *announced = None;
     }
     awaiting
+}
+
+/// Announced transactions asked for and not arrived yet, each with the
+/// other peers that announced it since, to ask in turn when a peer answers
+/// notfound. A transaction is asked of one peer at a time, and only of
+/// peers that announced it.
+#[derive(Default)]
+struct Requested {
+    asked: HashMap<Txid, VecDeque<u64>>,
+}
+
+impl Requested {
+    /// Most transactions in flight, and other announcers kept for each.
+    const MAX: usize = 100_000;
+    const MAX_OTHERS: usize = 8;
+
+    /// A peer announced `txid`: whether to ask it now.
+    fn announced(&mut self, txid: Txid, peer: u64) -> bool {
+        if let Some(others) = self.asked.get_mut(&txid) {
+            if others.len() < Self::MAX_OTHERS && !others.contains(&peer) {
+                others.push_back(peer);
+            }
+            return false;
+        }
+        if self.asked.len() >= Self::MAX {
+            self.asked.clear();
+        }
+        self.asked.insert(txid, VecDeque::new());
+        true
+    }
+
+    /// The peer asked for `txid` does not have it: the next to ask, if any.
+    fn not_found(&mut self, txid: Txid) -> Option<u64> {
+        let others = self.asked.get_mut(&txid)?;
+        let next = others.pop_front();
+        if next.is_none() {
+            // A later announcement asks again.
+            self.asked.remove(&txid);
+        }
+        next
+    }
+
+    fn arrived(&mut self, txid: &Txid) {
+        self.asked.remove(txid);
+    }
 }
 
 async fn sync_loop(inner: Arc<Inner>) {
@@ -1807,12 +1897,16 @@ fn scan_threads(config: &Config) -> usize {
     }
 }
 
-/// Finds the block that confirms `txid`.
+/// Finds the block that confirms `txid` (with its cover), and keeps the
+/// transaction: asked again, it is not downloaded again.
 async fn locate(
     inner: &Arc<Inner>,
     txid: Txid,
     height_hint: Option<u32>,
-) -> Result<(Arc<Block>, u32)> {
+) -> Result<Arc<found::FoundTx>> {
+    if let Some(found) = inner.found(&txid) {
+        return Ok(found);
+    }
     let mut candidates: Vec<u32> = Vec::new();
     if let Some(h) = height_hint {
         candidates.push(h);
@@ -1826,10 +1920,11 @@ async fn locate(
             candidates.push(h);
         }
     }
+    candidates.dedup();
     for &height in &candidates {
-        let block = block_at(inner, height).await?;
-        if block.txs.iter().any(|t| t.txid() == txid) {
-            return Ok((block, height));
+        let block = cover::block_with_cover(inner, height).await?;
+        if let Some(position) = block.txs.iter().position(|t| t.txid() == txid) {
+            return Ok(inner.keep_found(&block, height, position));
         }
     }
     match *inner.txid_keys.lock().expect("lock") {
@@ -1846,9 +1941,9 @@ async fn locate(
     let mut heights = matching_heights(inner, FilterKey::txid(&txid), 0).await?;
     heights.reverse();
     for height in heights {
-        let block = block_at(inner, height).await?;
-        if block.txs.iter().any(|t| t.txid() == txid) {
-            return Ok((block, height));
+        let block = cover::block_with_cover(inner, height).await?;
+        if let Some(position) = block.txs.iter().position(|t| t.txid() == txid) {
+            return Ok(inner.keep_found(&block, height, position));
         }
     }
     Err(Error::new(
@@ -1918,13 +2013,11 @@ async fn catch_up(inner: &Arc<Inner>) -> Result<()> {
                 .map(|(h, ks)| (h, ks.into_iter().map(|i| keys[i].key).collect()))
                 .collect()
         };
-        let mut fetch: BTreeSet<u32> = work.iter().map(|(h, _)| *h).collect();
-        if inner.config.decoy_blocks > 0 && !inner.config.download_all_blocks {
-            let mut rng = rand::thread_rng();
-            for _ in 0..work.len() * inner.config.decoy_blocks {
-                fetch.insert(rng.gen_range(0..=tip));
-            }
-        }
+        let fetch: BTreeSet<u32> = if inner.config.download_all_blocks {
+            work.iter().map(|(h, _)| *h).collect()
+        } else {
+            cover::cover_of(inner, work.iter().map(|(h, _)| *h))
+        };
         work.sort_by_key(|(h, _)| *h);
         let mut applied: HashSet<FilterKey> = HashSet::new();
         let mut queue: VecDeque<(u32, JoinHandle<Result<Arc<Block>>>)> = VecDeque::new();
@@ -2067,6 +2160,29 @@ mod tests {
         let tx = vec![0x42; 60];
         peer.send("tx", tx.clone());
         accepted_by(&peer, Txid(sha256d(&tx)), Duration::from_secs(5)).await
+    }
+
+    #[test]
+    fn a_transaction_a_peer_will_not_serve_is_asked_of_the_next_announcer() {
+        let (tx, other) = (Txid([1; 32]), Txid([2; 32]));
+        let mut requested = Requested::default();
+        assert!(requested.announced(tx, 1), "asked of the first announcer");
+        assert!(!requested.announced(tx, 2));
+        assert!(!requested.announced(tx, 2), "an announcer counted once");
+        assert!(!requested.announced(tx, 3));
+        assert_eq!(requested.not_found(tx), Some(2));
+        assert_eq!(requested.not_found(tx), Some(3));
+        assert_eq!(requested.not_found(tx), None);
+        assert!(
+            requested.announced(tx, 4),
+            "asked again when announced again"
+        );
+        requested.arrived(&tx);
+        assert!(
+            requested.announced(tx, 5),
+            "a new announcement after arriving"
+        );
+        assert_eq!(requested.not_found(other), None, "never asked");
     }
 
     #[test]

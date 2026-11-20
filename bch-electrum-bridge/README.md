@@ -6,8 +6,7 @@ protocol. A wallet that does should be a P2P light client itself, through the
 
 It answers the Electrum protocol (newline-delimited JSON-RPC over TCP) for
 such wallets. Every answer comes from the library: block headers, script
-filters (type 1), input prefix filters (type 2) and whole blocks read from
-Bitcoin Cash nodes over P2P, the mempool from ordinary transaction relay, and
+filters (type 1) and whole blocks read from Bitcoin Cash nodes over P2P, the mempool from ordinary transaction relay, and
 double-spend proofs from relay. The bridge adds only the protocol framing,
 the subscriptions and the answer shapes; it keeps no index of addresses,
 transactions or histories.
@@ -21,16 +20,29 @@ Run it beside the wallet, on the same machine, and point the wallet at it:
 It listens on a loopback address only, and refuses any other `--listen`:
 it serves wallets on this machine, never a network.
 
-At least one node must serve script filters (filter type 1); for
-`blockchain.rpa.*` one must also serve input prefix filters (type 2). Every
+At least one node must serve script filters (filter type 1).
+`blockchain.rpa.*` needs no input prefix filters: each search reads every
+block of its range, which names no prefix. Only with `--rpa-filters` does it
+read the blocks a node's input prefix filters (type 2) point to. Every
 `--peer` is connected. A node that serves no filters, such as BCHN, is kept
 for headers, blocks, transaction relay, its mempool and double-spend proofs,
 and is never asked for filters. A node that offers no bloom filters (kth
 today) does not answer the mempool message, so the transactions already in
 its mempool when the bridge connects are missed, and kth relays no
-double-spend proofs: give a BCHN node beside it for those. With `--proxy`,
-every block is fetched over a Tor circuit of its own; see the library's
-documentation for what peers can and cannot learn.
+double-spend proofs: give a BCHN node beside it for those.
+
+The library's protections are on by default:
+- Every block, and every broadcast, comes over a connection of its own. With
+  `--proxy`, that is a Tor circuit of its own.
+- Each block a lookup needs brings three decoys from its bucket of 144
+  heights. The decoys are the same in every session.
+- A transaction found once is not downloaded again.
+- The bridge introduces itself to nodes with Bitcoin Cash Node's user
+  agent, not a name of its own.
+
+`--no-block-isolation`, `--decoy-blocks`, `--rpa-filters` and `--user-agent`
+change these. See the library's documentation for what peers can and cannot
+learn, and what the protections cost.
 
 `blockchain.transaction.get` with `verbose` answers as BCHN's
 `getrawtransaction` does, which Fulcrum passes on: `asm`, output types,
@@ -67,8 +79,8 @@ under the `light_client.` prefix, which no Electrum server has; wallets
 that use them know they talk to this bridge. Every answer comes from the
 library without an index: a category's outputs from its filter keys, an
 identity's authchain from the filter keys of each identity output's script,
-with the blocks downloaded as for histories (with `--decoy-blocks`, and
-over Tor circuits of their own behind `--proxy`).
+with the blocks downloaded as for histories: with their decoys, each over
+a connection of its own.
 
 | Method | Parameters | Answer |
 |---|---|---|

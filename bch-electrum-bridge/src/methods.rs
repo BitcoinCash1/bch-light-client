@@ -1,6 +1,6 @@
 //! The Electrum protocol methods, each answered through the light client.
 
-use crate::session::{RpcError, ScriptSub, Session};
+use crate::session::{RpcError, ScriptSub, Session, Shared};
 use bch_light_client::bcmr::{registry_matches, Publication};
 use bch_light_client::block::BlockHeader;
 use bch_light_client::cashaddr::Address;
@@ -384,11 +384,11 @@ pub async fn call(session: &Arc<Session>, method: &str, params: &[Value]) -> Res
                 "dsproof": true,
                 "cashtokens": true,
             });
-            if let Some((start, _)) = client.rpa_heights() {
+            if session.shared.rpa {
                 features["rpa"] = json!({
                     "prefix_bits_min": RPA_PREFIX_BITS_MIN,
                     "prefix_bits": 16,
-                    "starting_height": start,
+                    "starting_height": client.rpa_start_height(),
                     "history_block_limit": RPA_HISTORY_BLOCK_LIMIT,
                     "max_history": RPA_MAX_HISTORY,
                 });
@@ -658,7 +658,7 @@ pub async fn call(session: &Arc<Session>, method: &str, params: &[Value]) -> Res
             let prefix = rpa_prefix_arg(params, 0)?;
             let from = from_height_arg(params, 1)?;
             let to = to_height_arg(params, 2, from)?;
-            rpa_history(client, prefix, from, to).await
+            rpa_history(&session.shared, prefix, from, to).await
         }
         "blockchain.reusable.get_history" => {
             // The older form: (from, count, prefix).
@@ -669,11 +669,11 @@ pub async fn call(session: &Arc<Session>, method: &str, params: &[Value]) -> Res
                 .filter(|c| *c >= 0)
                 .ok_or_else(|| RpcError::params("Bad count argument"))?;
             let to = from.saturating_add(u32::try_from(count).unwrap_or(u32::MAX));
-            rpa_history(client, prefix, from, Some(to)).await
+            rpa_history(&session.shared, prefix, from, Some(to)).await
         }
         "blockchain.rpa.get_mempool" | "blockchain.reusable.get_mempool" => {
             let prefix = rpa_prefix_arg(params, 0)?;
-            if client.rpa_heights().is_none() {
+            if !session.shared.rpa {
                 return Err(RpcError::not_found("RPA support is disabled on this server"));
             }
             let mut rows = Vec::new();
@@ -853,23 +853,22 @@ fn to_height_arg(params: &[Value], i: usize, from: u32) -> Result<Option<u32>> {
 }
 
 /// Fulcrum's rpa.get_history: from the RPA start height on, at most 60
-/// blocks from `from`, confirmed transactions only.
-async fn rpa_history(
-    client: &LightClient,
-    prefix: Prefix,
-    from: u32,
-    to: Option<u32>,
-) -> Result<Value> {
-    let Some((start, _)) = client.rpa_heights() else {
+/// blocks from `from`, confirmed transactions only. The library downloads
+/// every block of the range, unless --rpa-filters chose the filters.
+async fn rpa_history(shared: &Shared, prefix: Prefix, from: u32, to: Option<u32>) -> Result<Value> {
+    if !shared.rpa {
         return Err(RpcError::not_found(
             "RPA support is disabled on this server",
         ));
-    };
+    }
+    let client = &shared.client;
+    let start = client.rpa_start_height();
     if to.is_some_and(|to| to <= from) {
         return Ok(json!([]));
     }
-    // Up to the chain's tip: blocks there whose input prefix filters are not
-    // synced yet make the search an error, never an empty answer.
+    // Up to the chain's tip. Searched by the input prefix filters, blocks
+    // whose filters are not synced yet make the search an error, never an
+    // empty answer.
     let tip = client.tip().map(|t| t.0).unwrap_or(0);
     let from = from.max(start);
     let end = to
